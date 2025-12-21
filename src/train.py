@@ -7,6 +7,8 @@ import torch
 import pytorch_lightning as pl
 import yaml
 
+torch.set_float32_matmul_precision("high")   # or "medium"
+
 
 import sys
 basedir = Path(__file__).resolve().parent.parent
@@ -14,6 +16,7 @@ sys.path.append(str(basedir))
 
 from src.model.lightning import DrugFlow
 from src.model.dpo import DPO
+from src.model.energy_force_diffusion import EnergyForceDiffusion
 from src.utils import set_deterministic, disable_rdkit_logging, dict_to_namespace, namespace_to_dict
 
 
@@ -58,6 +61,7 @@ if __name__ == "__main__":
     p.add_argument('--finetune', action='store_true')
     p.add_argument('--debug', action='store_true')
     p.add_argument('--overfit', action='store_true')
+    p.add_argument('--test', action='store_true', help='Run trainer.test() after fit finishes')
     args = p.parse_args()
 
     set_deterministic(seed=42)
@@ -105,7 +109,11 @@ if __name__ == "__main__":
         print('OVERFITTING MODE')
 
     args.eval_params.outdir = out_dir
-    model_class = DPO if args.dpo_mode else DrugFlow
+    model_type = getattr(args, 'model_type', None)
+    if model_type in {'energy_force', 'energy_force_diffusion'}:
+        model_class = EnergyForceDiffusion
+    else:
+        model_class = DPO if args.dpo_mode else DrugFlow
     model_args = {
         'pocket_representation': args.pocket_representation,
         'train_params': args.train_params,
@@ -164,6 +172,17 @@ if __name__ == "__main__":
     lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval='step')
 
     default_strategy = 'auto' if pl.__version__ >= '2.0.0' else None
+
+    trainer_kwargs = {}
+    # EnergyForceDiffusion currently expects Trainer-level gradient clipping (its config
+    # exposes train_params.clip_grad but does not implement internal clipping like DrugFlow).
+    if getattr(args, "model_type", None) == "energy_force_diffusion" and bool(getattr(args.train_params, "clip_grad", False)):
+        clip_val = getattr(args.train_params, "gradient_clip_val", None)
+        if clip_val is None:
+            clip_val = 1.0
+        trainer_kwargs["gradient_clip_val"] = float(clip_val)
+        trainer_kwargs["gradient_clip_algorithm"] = "norm"
+
     trainer = pl.Trainer(
         max_epochs=args.train_params.n_epochs,
         logger=logger,
@@ -176,6 +195,7 @@ if __name__ == "__main__":
         devices=args.train_params.gpus if args.train_params.gpus > 0 else 'auto',
         strategy=('ddp_find_unused_parameters_true' if args.train_params.gpus > 1 else default_strategy),
         use_distributed_sampler=False,
+        **trainer_kwargs,
     )
 
     # add all arguments as dictionaries because WandB does not display
@@ -184,5 +204,5 @@ if __name__ == "__main__":
 
     trainer.fit(model=pl_module, ckpt_path=ckpt_path)
 
-    # # run test set
-    # result = trainer.test(ckpt_path='best')
+    if args.test:
+        trainer.test(model=pl_module, ckpt_path='best')

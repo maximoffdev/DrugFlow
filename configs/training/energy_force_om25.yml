@@ -1,0 +1,115 @@
+run_name: energy_force_om25
+model_type: energy_force_diffusion
+
+# Required by src/train.py even if unused by EnergyForceDiffusion
+pocket_representation: CA+
+virtual_nodes: null
+flexible: False
+flexible_bb: False
+
+autoregressive: False
+
+dpo_mode: null
+
+train_params:
+  logdir: ./runs
+  datadir: /media/data/qm_dataset/data/Pipeline/pkl/orca/qm9_16/qm9_16  # /media/data/qm_dataset/data/OM25_pkl/OM25_1M_HCNOSPClF_pkl
+  enable_progress_bar: True
+  num_sanity_val_steps: 0
+
+  batch_size: 64
+  accumulate_grad_batches: 1
+  lr: 5.0e-4
+  n_epochs: 100
+  num_workers: 0
+  gpus: 1
+  clip_grad: False
+
+  # OM25 PKL schema
+  pkl_pos_key: pos
+  pkl_atom_types_key: atomic_numbers
+  pkl_energy_key: e_total
+  pkl_forces_key: forces
+  pkl_atom_types_format: atomic_numbers
+
+  # OM25_1M_HCNOSPClF -> Z = [1, 6, 7, 8, 9, 15, 16, 17]
+  pkl_allowed_atomic_numbers: [1, 6, 7, 8, 9, 15, 16, 17]
+
+  # Flat-dir deterministic split
+  pkl_val_fraction: 0.01
+  pkl_val_n: null
+  pkl_split_seed: 42
+
+  # Optional: limit files for debugging, for full dataset use null
+  pkl_file_limit: null
+
+wandb_params:
+  mode: online  # disabled, offline, online
+  entity:
+  group: om25
+
+loss_params:
+  discrete_loss: CE  # CE or VLB
+  lambda_x: 1.0
+  lambda_h: 0.0
+  lambda_energy: 0.0
+  lambda_hjb: 0.0
+  lambda_consistency: 0.0
+  # Optional VE weighting (sigma(t)^2) in the coordinate DSM loss
+  x_score_weight_by_sigma: False
+  reduce: mean
+
+simulation_params:
+  n_steps: 1000
+
+  # Train with diffusion on coordinates only (atom types are conditioned as clean one_hot).
+  diffuse_h: False
+
+  # Score diffusion noise schedule for coordinates (t=0 noise -> t=1 clean)
+  sigma_min: 0.01
+  sigma_max: 50.0
+
+  coord_sde_kind: vp
+  beta_min: 0.1
+  beta_max: 20.0
+  vp_sigma_scale: 1.0  # keep 1.0 unless your coords are not normalized
+
+  # Temperature conditioning
+  # - training uses a single temperature for the whole batch, sampled uniformly
+  #   in [temperature_min, temperature_max]
+  # - validation/sampling uses temperature
+  temperature: 1.0
+  temperature_min: 0.99
+  temperature_max: 1.01
+
+eval_params:
+  eval_batch_size: 64
+  eval_epochs: 1
+  n_loss_per_sample: 1
+
+predictor_params:
+  # Use the same GVP backbone used by DrugFlow (radius graph message passing).
+  backbone: gvp
+
+  # Conditioning
+  condition_time: True
+  condition_temperature: False
+
+  # Radius-graph cutoff for ligand-only OM25 molecules.
+  # Set to null for fully-connected within each molecule.
+  edge_cutoff_ligand: 15.0
+  knn_k: 30
+
+  # Scalar hidden size for node embeddings used by heads/decoders.
+  hidden_nf: 128
+
+  # GVP backbone parameters (match DrugFlow naming)
+  reflection_equivariant: False
+  d_max: 15.0
+  num_rbf: 16
+  gvp_params:
+    n_layers: 5
+    node_h_dim: [128, 32]
+    edge_h_dim: [128, 32]
+    dropout: 0.0
+    vector_gate: True

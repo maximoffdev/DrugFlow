@@ -5,6 +5,7 @@ import torch
 import numpy as np
 import pickle
 from argparse import Namespace
+from typing import Dict
 
 from pathlib import Path
 
@@ -17,10 +18,43 @@ from src.analysis.visualization_utils import mols_to_pdbfile, mol_as_pdb
 from src.data.data_utils import TensorDict, Residues
 from src.data.postprocessing import process_all
 from src.model.lightning import DrugFlow
+from src.model.energy_force_diffusion import EnergyForceDiffusion
 from src.sbdd_metrics.evaluation import compute_all_metrics_drugflow
 
 from tqdm import tqdm
 from pdb import set_trace
+
+
+_Z_TO_SYMBOL = {
+    1: "H",
+    5: "B",
+    6: "C",
+    7: "N",
+    8: "O",
+    9: "F",
+    15: "P",
+    16: "S",
+    17: "Cl",
+}
+
+
+def write_xyz(path: Path, atomic_numbers: torch.Tensor, coords: torch.Tensor, comment: str = ""):
+    """Write a simple XYZ file from tensors.
+
+    Uses element symbols when known; otherwise writes 'X'.
+    """
+    if isinstance(coords, torch.Tensor):
+        coords = coords.detach().cpu()
+    if isinstance(atomic_numbers, torch.Tensor):
+        atomic_numbers = atomic_numbers.detach().cpu()
+
+    n = int(coords.size(0))
+    lines = [str(n), comment]
+    for z, (x, y, zc) in zip(atomic_numbers.tolist(), coords.tolist()):
+        sym = _Z_TO_SYMBOL.get(int(z), "X")
+        lines.append(f"{sym} {x:.6f} {y:.6f} {zc:.6f}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
 
 
 def combine(base_args, override_args):
@@ -49,10 +83,15 @@ def path_to_str(input_dict):
     return input_dict
 
 
-def sample(cfg, model_params, samples_dir, job_id=0, n_jobs=1):
+def sample(cfg, model_params: Dict, samples_dir, job_id=0, n_jobs=1):
     print('Sampling...')
-    model = DrugFlow.load_from_checkpoint(cfg.checkpoint, map_location=cfg.device, strict=False,
-                                          **model_params)
+    model_type = getattr(cfg, 'model_type', None)
+    if model_type in {"energy_force_diffusion", "energy_force"}:
+        model_class = EnergyForceDiffusion
+    else:
+        model_class = DrugFlow
+
+    model = model_class.load_from_checkpoint(cfg.checkpoint, map_location=cfg.device, strict=False, **model_params)
     model.setup(stage='fit' if cfg.set == 'train' else cfg.set)
     model.eval().to(cfg.device)
 
@@ -65,49 +104,98 @@ def sample(cfg, model_params, samples_dir, job_id=0, n_jobs=1):
             print(f'Skipping batch {i}')
             continue
 
-        new_data = {
-            'ligand': TensorDict(**data['ligand']).to(cfg.device),
-            'pocket': Residues(**data['pocket']).to(cfg.device),
-        }
-        try:
-            rdmols, rdpockets, names = model.sample(
-                data=new_data,
-                n_samples=cfg.n_samples,
-                num_nodes=("ground_truth" if cfg.sample_with_ground_truth_size else None)
-            )
-        except Exception as e:
-            if cfg.set == 'train':
-                names = data['ligand']['name']
-                print(f'Failed to sample for {names}: {e}')
-                continue
-            else:
-                raise e
+        if isinstance(model, EnergyForceDiffusion):
+            new_data = {
+                'ligand': TensorDict(**data['ligand']).to(cfg.device),
+                'pocket': TensorDict(**data['pocket']).to(cfg.device),
+            }
+            try:
+                ligands, _, names = model.sample(
+                    data=new_data,
+                    n_samples=cfg.n_samples,
+                    num_nodes=("ground_truth" if cfg.sample_with_ground_truth_size else None),
+                    timesteps=getattr(cfg, 'timesteps', None) or getattr(cfg, 'n_steps', None),
+                    x_sampler=getattr(cfg, 'x_sampler', 'ode'),
+                    h_sampler=getattr(cfg, 'h_sampler', 'markov_bridge'),
+                    stochastic_x=bool(getattr(cfg, 'stochastic_x', False)),
+                    stochastic_h=bool(getattr(cfg, 'stochastic_h', False)),
+                    temperature=getattr(cfg, 'temperature', None),
+                )
+            except Exception as e:
+                if cfg.set == 'train':
+                    names = data['ligand']['name']
+                    print(f'Failed to sample for {names}: {e}')
+                    continue
+                raise
 
-        for mol, pocket, name in zip(rdmols, rdpockets, names):
-            name = name.replace('.sdf', '')
-            idx = name2count.setdefault(name, 0)
-            output_dir = Path(samples_dir, name)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            if cfg.postprocess:
-                mol = process_all(mol, largest_frag=True, adjust_aromatic_Ns=True, relax_iter=0)
+            for lig, name in zip(ligands, names):
+                name = str(name).replace('.sdf', '').replace('.pkl', '')
+                idx = name2count.setdefault(name, 0)
+                output_dir = Path(samples_dir, name)
+                output_dir.mkdir(parents=True, exist_ok=True)
 
-            for prop in mol.GetAtoms()[0].GetPropsAsDict().keys():
-                # compute avg uncertainty
-                mol.SetDoubleProp(prop, np.mean([a.GetDoubleProp(prop) for a in mol.GetAtoms()]))
+                xyz_path = Path(output_dir, f'{idx}_ligand.xyz')
+                comment = f"x_sampler={getattr(cfg, 'x_sampler', 'ode')} h_sampler={getattr(cfg, 'h_sampler', 'markov_bridge')}"
+                write_xyz(xyz_path, lig['atomic_numbers'], lig['x'], comment=comment)
 
-                # visualise local differences
-                out_pdb_path = Path(output_dir, f'{idx}_ligand_{prop}.pdb')
-                mol_as_pdb(mol, out_pdb_path, bfactor=prop)
+                # Save raw tensors for inspection
+                torch.save(
+                    {
+                        'x': lig['x'],
+                        'atomic_numbers': lig['atomic_numbers'],
+                        'one_hot': lig['one_hot'],
+                    },
+                    Path(output_dir, f'{idx}_ligand.pt'),
+                )
 
-            out_sdf_path = Path(output_dir, f'{idx}_ligand.sdf')
-            out_pdb_path = Path(output_dir, f'{idx}_pocket.pdb')
-            utils.write_sdf_file(out_sdf_path, [mol])
-            mols_to_pdbfile([pocket], out_pdb_path)
+                name2count[name] += 1
 
-            name2count[name] += 1
+        else:
+            new_data = {
+                'ligand': TensorDict(**data['ligand']).to(cfg.device),
+                'pocket': Residues(**data['pocket']).to(cfg.device),
+            }
+            try:
+                rdmols, rdpockets, names = model.sample(
+                    data=new_data,
+                    n_samples=cfg.n_samples,
+                    num_nodes=("ground_truth" if cfg.sample_with_ground_truth_size else None)
+                )
+            except Exception as e:
+                if cfg.set == 'train':
+                    names = data['ligand']['name']
+                    print(f'Failed to sample for {names}: {e}')
+                    continue
+                else:
+                    raise e
+
+            for mol, pocket, name in zip(rdmols, rdpockets, names):
+                name = name.replace('.sdf', '')
+                idx = name2count.setdefault(name, 0)
+                output_dir = Path(samples_dir, name)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                if cfg.postprocess:
+                    mol = process_all(mol, largest_frag=True, adjust_aromatic_Ns=True, relax_iter=0)
+
+                for prop in mol.GetAtoms()[0].GetPropsAsDict().keys():
+                    # compute avg uncertainty
+                    mol.SetDoubleProp(prop, np.mean([a.GetDoubleProp(prop) for a in mol.GetAtoms()]))
+
+                    # visualise local differences
+                    out_pdb_path = Path(output_dir, f'{idx}_ligand_{prop}.pdb')
+                    mol_as_pdb(mol, out_pdb_path, bfactor=prop)
+
+                out_sdf_path = Path(output_dir, f'{idx}_ligand.sdf')
+                out_pdb_path = Path(output_dir, f'{idx}_pocket.pdb')
+                utils.write_sdf_file(out_sdf_path, [mol])
+                mols_to_pdbfile([pocket], out_pdb_path)
+
+                name2count[name] += 1
 
 
 def evaluate(cfg, model_params, samples_dir):
+    if getattr(cfg, 'model_type', None) in {"energy_force_diffusion", "energy_force"}:
+        raise NotImplementedError("Evaluation is only implemented for DrugFlow RDKit samples")
     print('Evaluation...')
     data, table_detailed, table_aggregated = compute_all_metrics_drugflow(
         in_dir=samples_dir,

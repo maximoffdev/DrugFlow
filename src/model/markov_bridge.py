@@ -61,10 +61,14 @@ class UniformPriorMarkovBridge:
         :return: one-hot encoded samples (n, dim)
         """
         sampled = torch.multinomial(p, 1).squeeze(-1)
-        return F.one_hot(sampled, num_classes=p.size(1)).float()
+        return F.one_hot(sampled, num_classes=p.size(1)).to(p.dtype)
 
     def p_z0(self, batch_mask):
-        return torch.ones((len(batch_mask), self.dim), device=batch_mask.device) / self.dim
+        return torch.ones(
+            (len(batch_mask), self.dim),
+            device=batch_mask.device,
+            dtype=torch.get_default_dtype(),
+        ) / self.dim
 
     def sample_z0(self, batch_mask):
         """ Prior. """
@@ -127,7 +131,7 @@ class UniformPriorMarkovBridge:
         beta_t_given_s = beta_t_given_s.unsqueeze(-1)[batch_mask]
 
         # Q_t = beta_t * I + (1 - beta_t) * ones (dot) z1^T
-        Qt = beta_t_given_s * torch.eye(self.dim, device=t.device).unsqueeze(0) + \
+        Qt = beta_t_given_s * torch.eye(self.dim, device=t.device, dtype=z1.dtype).unsqueeze(0) + \
              (1 - beta_t_given_s) * z1.unsqueeze(1)
              # (1 - beta_t_given_s) * (torch.ones(self.dim, 1, device=t.device) @ z1)
 
@@ -142,7 +146,7 @@ class UniformPriorMarkovBridge:
         beta_bar_t = beta_bar_t.unsqueeze(-1)[batch_mask]
 
         # Q_t_bar = beta_bar * I + (1 - beta_bar) * ones (dot) z1^T
-        Qt_bar = beta_bar_t * torch.eye(self.dim, device=t.device).unsqueeze(0) + \
+        Qt_bar = beta_bar_t * torch.eye(self.dim, device=t.device, dtype=z1.dtype).unsqueeze(0) + \
                  (1 - beta_bar_t) * z1.unsqueeze(1)
                  # (1 - beta_bar_t) * (torch.ones(self.dim, 1, device=t.device) @ z1)
 

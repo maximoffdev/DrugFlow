@@ -9,6 +9,7 @@ from torch.utils.data import Dataset
 
 from src.data.data_utils import TensorDict, collate_entity
 from src.constants import WEBDATASET_SHARD_SIZE, WEBDATASET_VAL_SIZE
+from src.data.pkl_dataset import PKLEnergyForceDataset
 
 
 class ProcessedLigandPocketDataset(Dataset):

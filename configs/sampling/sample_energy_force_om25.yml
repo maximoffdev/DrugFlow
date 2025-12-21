@@ -1,0 +1,49 @@
+# Sampling config for EnergyForceDiffusion (OMol25 PKL ligand-only)
+# Run with:
+#   python src/sample_and_evaluate.py --config configs/sampling/sample_energy_force_om25.yml
+
+# Required
+model_type: energy_force_diffusion
+checkpoint: /path/to/checkpoint.ckpt
+
+# Standard sampling harness options
+set: val               # train | val | test
+sample: true
+evaluate: false
+
+# Output
+sample_outdir: samples
+
+# Runtime
+device: cuda:0
+seed: 42
+n_samples: 4           # per conditioning example
+
+# Size handling
+sample_with_ground_truth_size: false   # if true: uses ground-truth ligand sizes
+# If false, sizes are sampled from size_distribution.npy (datadir or src/default fallback)
+
+# Diffusion sampling controls
+# timesteps (optional): overrides the model's internal n_steps for sampling
+timesteps: 50
+
+# Coordinate sampler
+x_sampler: ode         # ode | sde
+stochastic_x: false    # only used when x_sampler=sde
+
+# Atom-type sampler
+h_sampler: markov_bridge   # markov_bridge | score
+stochastic_h: false        # only used when h_sampler=score and x_sampler=sde
+
+# Conditioning
+temperature: 1.0
+
+# DrugFlow-only options (ignored for EnergyForceDiffusion)
+postprocess: false
+reduce: null
+exclude_evaluators: null
+
+# Optional override of checkpoint hyperparams (advanced)
+# model_args:
+#   simulation_params:
+#     temperature: 1.0

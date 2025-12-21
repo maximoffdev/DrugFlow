@@ -140,6 +140,21 @@ To launch the training job for the DrugFlow base model, for example, run
 python src/train.py --config $CONFIG
 ```
 
+### EnergyForceDiffusion (OMol25 PKL ligand-only)
+
+This repo also includes an OMol25-style PKL ligand-only workflow via the LightningModule `EnergyForceDiffusion`.
+It uses the same framework entrypoints (`src/train.py` for training/testing and `src/sample_and_evaluate.py` for sampling).
+
+Train:
+```bash
+python src/train.py --config configs/training/energy_force_om25.yml
+```
+
+Train + test:
+```bash
+python src/train.py --config configs/training/energy_force_om25.yml --test
+```
+
 
 ## Inference
 
@@ -178,6 +193,16 @@ python src/sample_and_evaluate.py --config configs/sampling/sample_and_maybe_eva
 ```
 which supports parallelization across target pockets by specifying `--job_id` and `--n_jobs`.
 To also evaluate the results, set `evaluate: True` in the sampling config file.
+
+### EnergyForceDiffusion sampling (tensor-only)
+
+Edit `checkpoint:` in `configs/sampling/sample_energy_force_om25.yml`, then run:
+```bash
+python src/sample_and_evaluate.py --config configs/sampling/sample_energy_force_om25.yml
+```
+
+Outputs for `EnergyForceDiffusion` are saved as `.xyz` coordinate dumps and `.pt` tensor files per sample.
+If `sample_with_ground_truth_size: false`, molecule sizes are sampled from `size_distribution.npy` (from `train_params.datadir` if present, otherwise `src/default/size_distribution.npy`).
 
 ### Evaluating samples
 
