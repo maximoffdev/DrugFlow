@@ -5,6 +5,7 @@ from typing import Literal, cast
 from pathlib import Path
 from typing import Optional, Union
 import warnings
+from contextlib import nullcontext
 
 import numpy as np
 import pytorch_lightning as pl
@@ -15,6 +16,7 @@ from src.data.pkl_dataset import PKLEnergyForceDataset, PKLKeys, split_pkl_file_
 from src.model.diffusion_utils import DistributionNodes
 from src.model.dynamics_radius_gvp import RadiusGVPDynamics, RadiusGVPParams
 from src.model.dynamics_radius_mlp import RadiusMLPDynamics, RadiusMLPParams
+from src.model.dynamics_scorenet_mlp import ScoreNetMLPDynamics, ScoreNetMLPParams
 from src.model.flows import CategoricalLogitScoreDiffusion, CoordScoreDiffusion, SDEParams
 from src.model.markov_bridge import UniformPriorMarkovBridge
 from src import utils
@@ -86,6 +88,9 @@ class EnergyForceDiffusion(pl.LightningModule):
         set_default(loss_params, "lambda_x", 1.0)
         set_default(loss_params, "lambda_h", 1.0)
         set_default(loss_params, "lambda_energy", 1.0)
+        # Optional regularizer: encourage energy head to be ~0 at t=0 (max noise).
+        # Default off to preserve existing behavior.
+        set_default(loss_params, "lambda_energy_t0", 0.0)
         # Optional HJB PDE loss + force/energy consistency (at noisy time)
         set_default(loss_params, "lambda_hjb", 0.0)
         set_default(loss_params, "lambda_consistency", 0.0)
@@ -107,6 +112,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.lambda_x = loss_params.lambda_x
         self.lambda_h = loss_params.lambda_h
         self.lambda_energy = loss_params.lambda_energy
+        self.lambda_energy_t0 = loss_params.lambda_energy_t0
         self.lambda_hjb = loss_params.lambda_hjb
         self.lambda_consistency = loss_params.lambda_consistency
 
@@ -167,9 +173,18 @@ class EnergyForceDiffusion(pl.LightningModule):
         set_default(simulation_params, "vp_beta_min", 0.1)
         set_default(simulation_params, "vp_beta_max", 20.0)
         set_default(simulation_params, "vp_sigma_scale", 1.0)
+        # Centering (translation invariance) for molecular data.
+        # NOTE: For toy tasks where absolute position matters (e.g., 2D energy landscapes),
+        # you may want to disable this via simulation_params.center_ligand=False.
+        set_default(simulation_params, "center_ligand", True)
+        self.center_ligand = bool(getattr(simulation_params, "center_ligand", True))
         set_default(simulation_params, "enforce_zero_com_noise", False)
         set_default(simulation_params, "project_predicted_force_zero_com", False)
         set_default(loss_params, "x_score_weight_by_sigma", False)
+        # HJB settings (divergence estimator + higher-order autodiff)
+        set_default(loss_params, "hjb_divergence", "hutchinson")
+        set_default(loss_params, "hjb_trace_samples", 1)
+        set_default(loss_params, "hjb_enable_higher_order", True)
 
         coord_sde = SDEParams(
             kind=cast(Literal["ve", "vp"], str(simulation_params.coord_sde_kind)),
@@ -250,6 +265,25 @@ class EnergyForceDiffusion(pl.LightningModule):
             )
             self.dynamics = RadiusMLPDynamics(atom_nf=self.atom_nf, x_dim=self.x_dim, params=params)
             self.condition_time = bool(condition_time)
+        elif backbone == "scorenet_mlp":
+            scorenet_mlp = getattr(predictor_params, "scorenet_mlp", Namespace())
+            hidden_dim = int(getattr(scorenet_mlp, "hidden_dim", 128))
+            time_emb_dim = int(getattr(scorenet_mlp, "time_emb_dim", 64))
+            num_layers = int(getattr(scorenet_mlp, "num_layers", 3))
+            condition_time = bool(getattr(scorenet_mlp, "condition_time", True))
+            # Keep temperature conditioning controlled by simulation_params.use_temperature.
+            condition_temperature = bool(self.use_temperature)
+
+            params = ScoreNetMLPParams(
+                input_dim=2,
+                hidden_dim=hidden_dim,
+                time_emb_dim=time_emb_dim,
+                num_layers=num_layers,
+                condition_time=condition_time,
+                condition_temperature=condition_temperature,
+            )
+            self.dynamics = ScoreNetMLPDynamics(atom_nf=self.atom_nf, x_dim=self.x_dim, params=params)
+            self.condition_time = bool(condition_time)
         else:
             raise ValueError(f"Unknown predictor_params.backbone: {backbone}")
 
@@ -267,6 +301,15 @@ class EnergyForceDiffusion(pl.LightningModule):
 
         # Sampling support (match DrugFlow UX)
         self.size_distribution: DistributionNodes | None = None
+
+        # HJB configuration
+        self.hjb_divergence = str(getattr(loss_params, "hjb_divergence", "hutchinson"))
+        self.hjb_trace_samples = int(getattr(loss_params, "hjb_trace_samples", 1))
+        self.hjb_enable_higher_order = bool(getattr(loss_params, "hjb_enable_higher_order", True))
+        if self.hjb_divergence not in {"exact", "hutchinson"}:
+            raise ValueError("loss_params.hjb_divergence must be one of: exact, hutchinson")
+        if self.hjb_trace_samples <= 0:
+            raise ValueError("loss_params.hjb_trace_samples must be >= 1")
 
     def configure_optimizers(self):
         optimizers = [
@@ -467,9 +510,11 @@ class EnergyForceDiffusion(pl.LightningModule):
         t: torch.Tensor | None = None,
         temperature: torch.Tensor | float | None = None,
     ):
-        # Center per-molecule for stability.
-        com = scatter_mean(ligand["x"], ligand["mask"], dim=0)
-        ligand["x"] = ligand["x"] - com[ligand["mask"]]
+        # Center per-molecule for stability / translation invariance (molecular setting).
+        # For 1-node toy graphs this would collapse all inputs to zero, so we make it optional.
+        if getattr(self, "center_ligand", True):
+            com = scatter_mean(ligand["x"], ligand["mask"], dim=0)
+            ligand["x"] = ligand["x"] - com[ligand["mask"]]
 
         # Timestep t for each example in batch
         if t is None:
@@ -514,50 +559,89 @@ class EnergyForceDiffusion(pl.LightningModule):
                     temperature = temperature.to(device=ligand["x"].device, dtype=t.dtype)
                     temp_val = float(temperature[0].detach().cpu().item())
 
-        # Noise
-        # Coordinates: perturb the clean sample x (t=1 clean) with sigma(t) (t=0 most noisy)
-        zt_x, _ = self.module_x.sample_zt(ligand["x"], t, ligand["mask"], temperature=temperature)
+        # If we only supervise the energy head (boundary condition at t=1), we can skip
+        # the noisy forward pass and all diffusion losses. This is much faster and avoids
+        # unnecessary work in toy notebooks.
+        need_x = float(self.lambda_x) > 0.0
+        need_h = float(self.lambda_h) > 0.0 and bool(self.diffuse_h)
+        need_hjb = float(self.lambda_hjb) > 0.0
+        need_consistency = float(self.lambda_consistency) > 0.0
+        need_noisy_pass = need_x or need_h or need_hjb or need_consistency
 
-        # Atom types: optionally diffuse, otherwise condition on clean one_hot.
-        if self.diffuse_h and (self.lambda_h is None or float(self.lambda_h) != 0.0):
-            z0_h = self.module_h.sample_z0(ligand["mask"])
-            zt_h = self.module_h.sample_zt(z0_h, ligand["one_hot"], t, ligand["mask"])
+        if need_noisy_pass:
+            # Noise
+            # Coordinates: perturb the clean sample x (t=1 clean) with sigma(t) (t=0 most noisy)
+            zt_x, _ = self.module_x.sample_zt(ligand["x"], t, ligand["mask"], temperature=temperature)
+
+            # Atom types: optionally diffuse, otherwise condition on clean one_hot.
+            if self.diffuse_h and (self.lambda_h is None or float(self.lambda_h) != 0.0):
+                z0_h = self.module_h.sample_z0(ligand["mask"])
+                zt_h = self.module_h.sample_zt(z0_h, ligand["one_hot"], t, ligand["mask"])
+            else:
+                zt_h = ligand["one_hot"]
         else:
-            zt_h = ligand["one_hot"]
+            zt_x = None
+            zt_h = None
 
-        zt_x = zt_x.detach().requires_grad_(True)
-        t = t.detach().requires_grad_(True)
+        # HJB/consistency require gradients w.r.t. (t, x). Lightning runs validation/test
+        # under torch.no_grad(), so we selectively re-enable grad when needed.
+        need_time_space_grads = need_hjb or need_consistency
 
-        pred_ligand, _ = self.dynamics(
-            zt_x,
-            zt_h,
-            ligand["mask"],
-            pocket=None,
-            t=t,
-            temperature=temperature,
-            bonds_ligand=None,
-            sc_transform=None,
-        )
+        # Only train with higher-order autodiff; during eval we can compute the residuals
+        # with create_graph=False to avoid massive memory usage.
+        enable_higher_order = bool(self.hjb_enable_higher_order and self.training)
+
+        grad_ctx = nullcontext()
+        if need_time_space_grads and (not torch.is_grad_enabled()):
+            grad_ctx = torch.enable_grad()
+
+        if need_noisy_pass:
+            assert zt_x is not None
+            assert zt_h is not None
+            with grad_ctx:
+                zt_x = zt_x.detach().requires_grad_(need_time_space_grads)
+                t = t.detach().requires_grad_(need_time_space_grads)
+
+                pred_ligand, _ = self.dynamics(
+                    zt_x,
+                    zt_h,
+                    ligand["mask"],
+                    pocket=None,
+                    t=t,
+                    temperature=temperature,
+                    bonds_ligand=None,
+                    sc_transform=None,
+                )
+        else:
+            # No noisy pass needed; keep placeholders for logging.
+            pred_ligand = None
 
         # Coordinate score matching loss
         # Convention: dynamics returns `force` which we interpret as the coordinate score.
 
         ######## Compute coordinate score loss ########
 
-        loss_x = self.module_x.score_loss(
-            pred_ligand["force"],
-            ligand["x"],
-            zt_x,
-            t,
-            ligand["mask"],
-            reduce=self.loss_reduce,
-            temperature=temperature,
-            weight_by_sigma=self.x_score_weight_by_sigma,
-        )
+        if need_x:
+            assert pred_ligand is not None
+            assert zt_x is not None
+            loss_x = self.module_x.score_loss(
+                pred_ligand["force"],
+                ligand["x"],
+                zt_x,
+                t,
+                ligand["mask"],
+                reduce=self.loss_reduce,
+                temperature=temperature,
+                weight_by_sigma=self.x_score_weight_by_sigma,
+            )
+        else:
+            loss_x = torch.zeros((ligand["size"].size(0),), device=ligand["x"].device, dtype=ligand["x"].dtype)
 
         ######## Compute atom-type loss ########
 
-        if self.diffuse_h and (self.lambda_h is None or float(self.lambda_h) != 0.0):
+        if need_h and self.diffuse_h and (self.lambda_h is None or float(self.lambda_h) != 0.0):
+            assert pred_ligand is not None
+            assert zt_h is not None
             t_next = torch.clamp(t + self.train_step_size, max=1.0)
             loss_h = self.module_h.compute_loss(
                 pred_ligand["logits_h"],
@@ -574,6 +658,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         # Supervised energy head (computed on clean x/h).
         # Use t=1.0 for the energy head to represent the clean configuration.
         loss_energy = torch.zeros_like(loss_x)
+        loss_energy_t0 = torch.zeros_like(loss_x)
         loss_hjb = torch.zeros_like(loss_x)
         loss_consistency = torch.zeros_like(loss_x)
 
@@ -607,9 +692,35 @@ class EnergyForceDiffusion(pl.LightningModule):
                 raise ValueError(f"energy_pred must have shape (B,), got {tuple(energy_pred.shape)} vs target {tuple(energy_tgt.shape)}")
             loss_energy = (energy_pred - energy_tgt) ** 2
 
-            print("True energy:", energy_tgt[:5].detach().cpu().numpy())
-            print("Pred energy:", energy_pred[:5].detach().cpu().numpy())
-            print()
+            # print("True energy:", energy_tgt[:5].detach().cpu().numpy())
+            # print("Pred energy:", energy_pred[:5].detach().cpu().numpy())
+            # print()
+
+        ######## Energy reference at t=0 (max noise): enforce u(x,t=0) ~ 0 ########
+
+        # This is a gauge-fixing / stabilization regularizer for score-based training where
+        # absolute energy offsets are otherwise weakly identified.
+        if float(self.lambda_energy_t0) > 0.0:
+            # Evaluate energy head at t=0. We use a strongly noised version of the current
+            # clean configuration to better match the distribution seen near t=0.
+            t0 = torch.zeros_like(t)
+            x_t0, _ = self.module_x.sample_zt(ligand["x"], t0, ligand["mask"], temperature=temperature)
+            pred_t0, _ = self.dynamics(
+                x_t0,
+                ligand["one_hot"],
+                ligand["mask"],
+                pocket=None,
+                t=t0,
+                temperature=temperature,
+                bonds_ligand=None,
+                sc_transform=None,
+            )
+            energy_pred_t0 = pred_t0["energy"].to(dtype=ligand["x"].dtype).view(-1)
+            if energy_pred_t0.shape != loss_x.shape:
+                raise ValueError(
+                    f"energy_pred(t=0) must have shape (B,), got {tuple(energy_pred_t0.shape)} vs expected {tuple(loss_x.shape)}"
+                )
+            loss_energy_t0 = energy_pred_t0 ** 2
 
         ######## HJB loss + consistency condition at the *noisy* state (zt_x, t). ########
 
@@ -617,21 +728,32 @@ class EnergyForceDiffusion(pl.LightningModule):
         #  - L_hjb: mean squared HJB residual (per molecule)
         #  - L_consistency: mean squared (F + ∇_x u) (per molecule)
         # Boundary condition u(x, t=1) = u_ref is handled by loss_energy above.
-        if (float(self.lambda_hjb) > 0.0) or (float(self.lambda_consistency) > 0.0):
-            loss_hjb, loss_consistency = self.module_x.hjb_loss(
-                pred_ligand["force"].to(dtype=ligand["x"].dtype),
-                pred_ligand["energy"].to(dtype=ligand["x"].dtype).view(-1),
-                zt_x,
-                t,
-                ligand["mask"],
-                temperature=temperature,
-                reduce=self.loss_reduce,
-            )
+        if need_noisy_pass and ((float(self.lambda_hjb) > 0.0) or (float(self.lambda_consistency) > 0.0)):
+            assert pred_ligand is not None
+            assert zt_x is not None
+            # Lightning wraps validation/test in torch.no_grad(). Autograd-based HJB terms
+            # must run under torch.enable_grad() to build the necessary graphs.
+            with grad_ctx:
+                loss_hjb, loss_consistency = self.module_x.hjb_loss(
+                    pred_ligand["force"].to(dtype=ligand["x"].dtype),
+                    pred_ligand["energy"].to(dtype=ligand["x"].dtype).view(-1),
+                    zt_x,
+                    t,
+                    ligand["mask"],
+                    temperature=temperature,
+                    reduce=self.loss_reduce,
+                    divergence=cast(Literal["exact", "hutchinson"], self.hjb_divergence),
+                    n_trace_samples=self.hjb_trace_samples,
+                    enable_higher_order=enable_higher_order,
+                    compute_hjb=float(self.lambda_hjb) > 0.0,
+                    compute_consistency=float(self.lambda_consistency) > 0.0,
+                )
 
         loss = (
             self.lambda_x * loss_x
             + self.lambda_h * loss_h
             + self.lambda_energy * loss_energy
+            + self.lambda_energy_t0 * loss_energy_t0
             + self.lambda_hjb * loss_hjb
             + self.lambda_consistency * loss_consistency
         )
@@ -641,13 +763,14 @@ class EnergyForceDiffusion(pl.LightningModule):
             "loss_x": float(loss_x.mean().detach().cpu()),
             "loss_h": float(loss_h.mean().detach().cpu()),
             "loss_energy": float(loss_energy.mean().detach().cpu()),
+            "loss_energy_t0": float(loss_energy_t0.mean().detach().cpu()),
             "loss_hjb": float(loss_hjb.mean().detach().cpu()),
             "loss_consistency": float(loss_consistency.mean().detach().cpu()),
             "temperature": float(temp_val),
             "diffuse_h": bool(self.diffuse_h and (self.lambda_h is None or float(self.lambda_h) != 0.0)),
         }
 
-        if self.log_diffusion_stats:
+        if self.log_diffusion_stats and need_noisy_pass and (pred_ligand is not None) and (zt_x is not None):
             with torch.no_grad():
                 sigma_b = self.module_x.sigma(t.detach(), temperature=temperature).view(-1)
                 target = self.module_x.score_target(zt_x.detach(), ligand["x"].detach(), t.detach(), ligand["mask"], temperature=temperature)
@@ -856,6 +979,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         temperature: float | None = None,
         x_sampler: str = "ode",
         h_sampler: str = "markov_bridge",
+        atom_type_prior: Literal["uniform"] = "uniform",
         stochastic_x: bool = False,
         stochastic_h: bool = False,
     ):
@@ -872,6 +996,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         """
         assert x_sampler in {"ode", "sde"}
         assert h_sampler in {"markov_bridge", "score"}
+        assert atom_type_prior in {"uniform"}
 
         device = self.device
         dtype = next(self.parameters()).dtype
@@ -897,12 +1022,23 @@ class EnergyForceDiffusion(pl.LightningModule):
         x = self.module_x.sample_z1(com, batch_mask, temperature=t_temperature)
 
         # Initialize atoms.
-        if h_sampler == "markov_bridge":
-            h = self.module_h.sample_z0(batch_mask)  # one-hot
+        # If atom-type diffusion is disabled, we must provide a "clean" categorical conditioning
+        # signal to the dynamics. Since the model is not trained to generate atom types (and
+        # logits_h may be untrained), sample atom types from a simple prior and keep them fixed.
+        if not self.diffuse_h:
+            if atom_type_prior == "uniform":
+                idx = torch.randint(self.atom_nf, (batch_mask.shape[0],), device=device)
+            else:
+                raise ValueError(f"Unsupported atom_type_prior: {atom_type_prior}")
+            h = torch.nn.functional.one_hot(idx, num_classes=self.atom_nf).to(dtype)
             h_logits = None
         else:
-            h_logits = self.module_h_score.sample_prior(batch_mask, temperature=t_temperature, dtype=dtype)
-            h = self.module_h_score.logits_to_probs(h_logits)
+            if h_sampler == "markov_bridge":
+                h = self.module_h.sample_z0(batch_mask)  # one-hot
+                h_logits = None
+            else:
+                h_logits = self.module_h_score.sample_prior(batch_mask, temperature=t_temperature, dtype=dtype)
+                h = self.module_h_score.logits_to_probs(h_logits)
 
         dt = 1.0 / float(timesteps)
         for i in range(timesteps):
@@ -937,44 +1073,48 @@ class EnergyForceDiffusion(pl.LightningModule):
                 )
 
             # Enforce translation invariance (match training which centers per molecule).
-            com = scatter_mean(x, batch_mask, dim=0)
-            x = x - com[batch_mask]
+            # IMPORTANT: for toy settings (e.g., 1-node graphs learning an absolute-position
+            # energy field), centering will collapse all samples to the origin.
+            if getattr(self, "center_ligand", True):
+                com = scatter_mean(x, batch_mask, dim=0)
+                x = x - com[batch_mask]
 
             # Atom types.
-            if h_sampler == "markov_bridge":
-                h = self.module_h.sample_zt_given_zs(
-                    h,
-                    pred_ligand["logits_h"],
-                    s=s,
-                    t=t,
-                    batch_mask=batch_mask,
-                )
-            else:
-                # Interpret dynamics logits_h as score in logit-space.
-                assert h_logits is not None
-                if x_sampler == "ode":
-                    h_logits = self.module_h_score.ode_step(
-                        h_logits,
+            if self.diffuse_h:
+                if h_sampler == "markov_bridge":
+                    h = self.module_h.sample_zt_given_zs(
+                        h,
                         pred_ligand["logits_h"],
                         s=s,
                         t=t,
                         batch_mask=batch_mask,
-                        temperature=t_temperature,
                     )
                 else:
-                    h_logits = self.module_h_score.reverse_step(
-                        h_logits,
-                        pred_ligand["logits_h"],
-                        s=s,
-                        t=t,
-                        batch_mask=batch_mask,
-                        temperature=t_temperature,
-                        stochastic=stochastic_h,
-                    )
-                h = self.module_h_score.logits_to_probs(h_logits)
+                    # Interpret dynamics logits_h as score in logit-space.
+                    assert h_logits is not None
+                    if x_sampler == "ode":
+                        h_logits = self.module_h_score.ode_step(
+                            h_logits,
+                            pred_ligand["logits_h"],
+                            s=s,
+                            t=t,
+                            batch_mask=batch_mask,
+                            temperature=t_temperature,
+                        )
+                    else:
+                        h_logits = self.module_h_score.reverse_step(
+                            h_logits,
+                            pred_ligand["logits_h"],
+                            s=s,
+                            t=t,
+                            batch_mask=batch_mask,
+                            temperature=t_temperature,
+                            stochastic=stochastic_h,
+                        )
+                    h = self.module_h_score.logits_to_probs(h_logits)
 
         # Finalize categorical sample
-        if h_sampler == "score":
+        if self.diffuse_h and h_sampler == "score":
             idx = torch.argmax(h, dim=-1)
             h = torch.nn.functional.one_hot(idx, num_classes=self.atom_nf).to(h.dtype)
 

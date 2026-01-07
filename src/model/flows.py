@@ -5,6 +5,7 @@ import torch
 from torch_scatter import scatter_mean, scatter_add
 from dataclasses import dataclass
 from typing import Literal, Optional
+from IPython.display import display, Markdown
 
 import src.data.so3_utils as so3
 
@@ -721,14 +722,114 @@ class CoordScoreDiffusion:
         per_node = torch.sum((score_pred - target) ** 2, dim=-1)
 
         if weight_by_sigma:
+            # print("per npde before sigma weighting: ", per_node.mean().item(), per_node.std().item())
             sigma_t = self.sigma(t, temperature=temperature)[batch_mask].squeeze(-1)
             per_node = per_node * (sigma_t * sigma_t)
+        #     print("sigma_t:", sigma_t.mean().item(), sigma_t.std().item())
+        # print("Score Loss Stats: ", per_node.mean().item(), per_node.std().item())
 
         # print("True Score Stats: ", target.mean().item(), target.std().item())
         # print("Pred Score Stats: ", score_pred.mean().item(), score_pred.std().item())
         # print()
 
         return self.reduce_loss(per_node, batch_mask, reduce)
+
+    def _ve_sigma_forward(self, tau: torch.Tensor, temperature: torch.Tensor | None = None) -> torch.Tensor:
+        """Forward-time VE sigma schedule.
+
+        This is expressed in diffusion (forward) time tau where tau=0 is clean and tau=1 is max noise.
+        """
+        tau = torch.clamp(tau, 0.0, 1.0)
+        sigma = float(self.sde.sigma_min) * (float(self.sde.sigma_max) / float(self.sde.sigma_min)) ** tau
+        if isinstance(temperature, torch.Tensor):
+            # Mirror sigma() temperature scaling: sigma <- sigma * sqrt(T)
+            if temperature.numel() == 1:
+                temperature = temperature.expand_as(tau)
+            T_ref = 1.0
+            sigma = sigma * torch.sqrt(torch.clamp(temperature / T_ref, min=1e-6))
+        return sigma
+
+    def _sde_g2_forward(self, tau: torch.Tensor, temperature: torch.Tensor | None = None) -> torch.Tensor:
+        """Return g(tau)^2 for the forward SDE coefficients.
+
+        Shapes:
+          tau: (B,1)
+          returns: (B,)
+        """
+        tau = torch.clamp(tau, 0.0, 1.0)
+
+        if self.sde.kind == "ve":
+            sigma_tau = self._ve_sigma_forward(tau, temperature=temperature).view(-1)
+            log_ratio = math.log(float(self.sde.sigma_max) / float(self.sde.sigma_min))
+            return (2.0 * log_ratio) * (sigma_tau * sigma_tau)
+
+        if self.sde.kind == "vp":
+            beta0 = float(self.sde.beta_min)
+            beta1 = float(self.sde.beta_max)
+            beta = (beta0 + (beta1 - beta0) * tau)
+            if isinstance(temperature, torch.Tensor):
+                beta = beta * torch.clamp(temperature, min=1e-6)
+            vp_scale = float(self.sde.vp_sigma_scale)
+            return beta.view(-1) * (vp_scale * vp_scale)
+
+        raise ValueError(f"Unknown SDE kind: {self.sde.kind}")
+
+    def _sde_f_forward(
+        self,
+        x: torch.Tensor,
+        tau: torch.Tensor,
+        batch_mask: torch.Tensor,
+        temperature: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return drift f(x,tau) for the forward SDE coefficients.
+
+        Shapes:
+          x: (N,dim)
+          tau: (B,1)
+          returns: (N,dim)
+        """
+        if self.sde.kind == "ve":
+            return torch.zeros_like(x)
+
+        if self.sde.kind == "vp":
+            tau = torch.clamp(tau, 0.0, 1.0)
+            beta0 = float(self.sde.beta_min)
+            beta1 = float(self.sde.beta_max)
+            beta = (beta0 + (beta1 - beta0) * tau)
+            if isinstance(temperature, torch.Tensor):
+                beta = beta * torch.clamp(temperature, min=1e-6)
+            beta_node = beta[batch_mask]
+            return -0.5 * beta_node * x
+
+        raise ValueError(f"Unknown SDE kind: {self.sde.kind}")
+
+    def _sde_div_f_forward(
+        self,
+        x: torch.Tensor,
+        tau: torch.Tensor,
+        batch_mask: torch.Tensor,
+        temperature: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return div(f)(x,tau) aggregated per example (B,)."""
+        B = int(batch_mask.max().item()) + 1 if batch_mask.numel() > 0 else 0
+        if B == 0:
+            return torch.empty((0,), device=x.device, dtype=x.dtype)
+
+        if self.sde.kind == "ve":
+            return torch.zeros((B,), device=x.device, dtype=x.dtype)
+
+        if self.sde.kind == "vp":
+            tau = torch.clamp(tau, 0.0, 1.0)
+            beta0 = float(self.sde.beta_min)
+            beta1 = float(self.sde.beta_max)
+            beta = (beta0 + (beta1 - beta0) * tau)
+            if isinstance(temperature, torch.Tensor):
+                beta = beta * torch.clamp(temperature, min=1e-6)
+            beta_node = beta[batch_mask]
+            div_f_node = -0.5 * beta_node.view(-1) * float(x.size(-1))
+            return scatter_add(div_f_node, batch_mask, dim=0)
+
+        raise ValueError(f"Unknown SDE kind: {self.sde.kind}")
     
     def hjb_loss(
         self,
@@ -740,6 +841,11 @@ class CoordScoreDiffusion:
         *,
         temperature: torch.Tensor | float | None = None,
         reduce: str = "mean",
+        divergence: Literal["exact", "hutchinson"] = "hutchinson",
+        n_trace_samples: int = 1,
+        enable_higher_order: bool = True,
+        compute_hjb: bool = True,
+        compute_consistency: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute HJB residual loss + force/energy consistency.
 
@@ -751,6 +857,11 @@ class CoordScoreDiffusion:
           loss_consistency: shape (B,) mean-squared (F + ∇_x u) per example
         """
         assert reduce in {"mean", "sum", "none"}
+
+        if int(n_trace_samples) <= 0:
+            raise ValueError(f"n_trace_samples must be >= 1; got {n_trace_samples}")
+
+        create_graph = bool(enable_higher_order)
 
         B = int(batch_mask.max().item()) + 1 if batch_mask.numel() > 0 else 0
         if B == 0:
@@ -776,88 +887,139 @@ class CoordScoreDiffusion:
             if temperature_t.shape != (B, 1):
                 raise ValueError(f"temperature must have shape (B,1) or scalar; got {tuple(temperature_t.shape)}")
 
-        # HJB is written in forward-time tau where tau=0 is clean.
-        # Our convention is t=0 noisy -> t=1 clean, so tau = 1 - t.
-        # Hence: du/dtau = -du/dt.
-        du_dt = torch.autograd.grad(
-            outputs=u_pred.sum(),
-            inputs=t,
-            create_graph=True,
-            retain_graph=True,
-            allow_unused=False,
-        )[0]
-        du_dtau = -du_dt.view(-1)
+        tau = self._tau(t)
 
-        # ∇_x u
-        du_dx = torch.autograd.grad(
-            outputs=u_pred.sum(),
-            inputs=x,
-            create_graph=True,
-            retain_graph=True,
-            allow_unused=False,
-        )[0]
-
-        # div(F) = trace(dF/dx)
-        div_F_node = torch.zeros((x.size(0),), device=x.device, dtype=x.dtype)
-        for i in range(x.size(-1)):
-            grad_Fi = torch.autograd.grad(
-                outputs=F_pred[:, i].sum(),
-                inputs=x,
-                create_graph=True,
+        # We evaluate SDE coefficients using diffusion forward-time tau = 1 - t.
+        # The network was evaluated at `t`, so to obtain du/dtau we use the chain rule:
+        #   tau = 1 - t  =>  du/dtau = -du/dt.
+        du_dx = None
+        if compute_hjb:
+            # If enable_higher_order=True we keep retain_graph=True to ensure the outer backward
+            # can backpropagate through these autograd.grad calls.
+            du_dt = torch.autograd.grad(
+                outputs=u_pred.sum(),
+                inputs=t,
+                create_graph=create_graph,
                 retain_graph=True,
                 allow_unused=False,
             )[0]
-            div_F_node = div_F_node + grad_Fi[:, i]
-        div_F = scatter_add(div_F_node, batch_mask, dim=0)
+            du_dt = -du_dt.view(-1)    # du/dtau
 
-        # Forward-time coefficients in tau
-        tau = 1.0 - t  # (B,1)
+            # If we also need the consistency term, compute ∇_x u *before* the divergence
+            # computation. In eval/logging mode (create_graph=False) the divergence autograd.grad
+            # would otherwise free the shared forward graph and break this subsequent grad call.
+            if compute_consistency:
+                du_dx = torch.autograd.grad(
+                    outputs=u_pred.sum(),
+                    inputs=x,
+                    create_graph=create_graph,
+                    retain_graph=True,
+                    allow_unused=False,
+                )[0]
+
+            # div(F) = trace(dF/dx)
+            # Exact computation is expensive (and memory-heavy). Hutchinson estimator is the default.
+            if divergence == "exact":
+                div_F_node = torch.zeros((x.size(0),), device=x.device, dtype=x.dtype)
+                for i in range(x.size(-1)):
+                    # If training with higher-order grads, retain for outer backward.
+                    # Otherwise, only retain until the final component.
+                    retain = True if create_graph else (i < x.size(-1) - 1)
+                    grad_Fi = torch.autograd.grad(
+                        outputs=F_pred[:, i].sum(),
+                        inputs=x,
+                        create_graph=create_graph,
+                        retain_graph=retain,
+                        allow_unused=False,
+                    )[0]
+                    div_F_node = div_F_node + grad_Fi[:, i]
+                div_F = scatter_add(div_F_node, batch_mask, dim=0)
+
+            elif divergence == "hutchinson":
+                # Hutchinson trace estimator:
+                #   tr(J) = E_v [ v^T J v ] for Rademacher v.
+                # We compute v^T J v using a single VJP: grad_x (sum_i F_i(x) v_i) = J^T v.
+                div_F_accum = torch.zeros((B,), device=x.device, dtype=x.dtype)
+                n_samples = int(n_trace_samples)
+                for s_idx in range(n_samples):
+                    v = torch.empty_like(x).bernoulli_(0.5)
+                    v = v.mul_(2.0).add_(-1.0)
+
+                    scalar = torch.sum(F_pred * v)
+                    # If training with higher-order grads, retain for outer backward.
+                    # Otherwise, only retain if we will take another trace sample.
+                    retain = True if create_graph else (s_idx < n_samples - 1)
+                    Jt_v = torch.autograd.grad(
+                        outputs=scalar,
+                        inputs=x,
+                        create_graph=create_graph,
+                        retain_graph=retain,
+                        allow_unused=False,
+                    )[0]
+                    div_node = torch.sum(Jt_v * v, dim=-1)
+                    div_F_accum = div_F_accum + scatter_add(div_node, batch_mask, dim=0)
+                div_F = div_F_accum / float(n_samples)
+
+            else:
+                raise ValueError(f"Unknown divergence mode: {divergence}")
+        else:
+            du_dt = torch.zeros((B,), device=x.device, dtype=x.dtype)
+            div_F = torch.zeros((B,), device=x.device, dtype=x.dtype)
+
         temp_denom = torch.clamp(temperature_t.view(-1), min=1e-6)
 
-        if self.sde.kind == "ve":
-            # Forward VE: dx = g(tau) dW, with g^2 = d/dtau sigma(tau)^2.
-            # For geometric sigma schedule: d/dtau sigma^2 = 2*log(sigma_max/sigma_min) * sigma^2.
-            sigma = self.sigma(t, temperature=temperature_t).view(-1)
-            log_ratio = math.log(float(self.sde.sigma_max) / float(self.sde.sigma_min))
-            g2 = (2.0 * log_ratio) * (sigma * sigma)
-
-            F_dot_f = torch.zeros((B,), device=x.device, dtype=x.dtype)
-            div_f = torch.zeros((B,), device=x.device, dtype=x.dtype)
-        else:
-            # Forward VP: dx = f(x,tau) dtau + g(tau) dW
-            # f = -0.5 * beta(tau) * x, g^2 = beta(tau)
-            beta0 = float(self.sde.beta_min)
-            beta1 = float(self.sde.beta_max)
-            beta = (beta0 + (beta1 - beta0) * tau)  # (B,1)
-            # Temperature scaling matches alpha(): beta <- beta * temperature
-            beta = beta * torch.clamp(temperature_t, min=1e-6)
-
-            g2 = beta.view(-1) * (float(self.sde.vp_sigma_scale) ** 2)
-
-            beta_node = beta[batch_mask]
-            f_node = -0.5 * beta_node * x
-            F_dot_f = scatter_add(torch.sum(F_pred * f_node, dim=-1), batch_mask, dim=0)
-
-            # div(f) for linear drift: per-node divergence = -0.5 * beta * dim
-            div_f_node = -0.5 * beta_node.view(-1) * float(x.size(-1))
-            div_f = scatter_add(div_f_node, batch_mask, dim=0)
+        g2 = self._sde_g2_forward(tau, temperature=temperature_t)
+        f_node = self._sde_f_forward(x, tau, batch_mask, temperature=temperature_t)
+        F_dot_f = scatter_add(torch.sum(F_pred * f_node, dim=-1), batch_mask, dim=0)
+        div_f = self._sde_div_f_forward(x, tau, batch_mask, temperature=temperature_t)
 
         F_norm2 = scatter_add(torch.sum(F_pred * F_pred, dim=-1), batch_mask, dim=0)
 
-        hjb_residual = (
-            du_dtau
-            - F_dot_f
-            + 0.5 * g2 * F_norm2 / temp_denom
-            - div_f
-            + 0.5 * g2 * div_F / temp_denom
-        )
-        loss_hjb = hjb_residual * hjb_residual
+        if compute_hjb:
+            hjb_residual = (
+                du_dt
+                - F_dot_f
+                + 0.5 * g2 * F_norm2 / temp_denom
+                - div_f
+                + 0.5 * g2 * div_F / temp_denom
+            )
+            loss_hjb = hjb_residual * hjb_residual
+        else:
+            loss_hjb = torch.zeros((B,), device=x.device, dtype=x.dtype)
 
-        per_node_cons = torch.mean((F_pred + du_dx) ** 2, dim=-1)
-        loss_consistency = scatter_mean(per_node_cons, batch_mask, dim=0)
+        if compute_consistency:
+            # ∇_x u is only needed for the consistency term; skip it when lambda_consistency=0.
+            if du_dx is None:
+                du_dx = torch.autograd.grad(
+                    outputs=u_pred.sum(),
+                    inputs=x,
+                    create_graph=create_graph,
+                    retain_graph=True if create_graph else False,
+                    allow_unused=False,
+                )[0]
+            per_node_cons = torch.mean((F_pred + du_dx) ** 2, dim=-1)
+            loss_consistency = scatter_mean(per_node_cons, batch_mask, dim=0)
+        else:
+            loss_consistency = torch.zeros((B,), device=x.device, dtype=x.dtype)
+            
+        # Create a single string with labels
+        status_msg = (
+            f"du_dt: {du_dt.mean():.4f} | "
+            f"F_dot_f: {F_dot_f.mean():.4f} | "
+            f"Term3: {torch.mean(0.5 * g2 * F_norm2 / temp_denom):.4f} | "
+            f"div_f: {div_f.mean():.4f} | "
+            f"Term5: {torch.mean(0.5 * g2 * div_F / temp_denom):.4f}"
+        )
+
+        # Print with end='\r' to return to the start of the line instead of a new line
+        print(status_msg, end='\r')
 
         if reduce == "none":
             return loss_hjb, loss_consistency
+        
+        # print("force_pred Stats: ", F_pred.mean().item(), F_pred.std().item())
+        # print("force true Stats: ", -du_dx.mean().item(), (-du_dx).std().item())
+
         # Keep per-example shape (B,) for compatibility; reduce only affects node aggregation above.
         return loss_hjb, loss_consistency
 
@@ -874,12 +1036,56 @@ class CoordScoreDiffusion:
         """Single denoising step from time s to time t (expects 0 <= s < t <= 1).
 
         VE: uses the original discretization.
-        VP: falls back to deterministic ODE step.
+        VP: uses a reverse-SDE Euler-Maruyama step when stochastic=True; otherwise uses
+            the deterministic probability-flow ODE step.
         """
         if self.project_predicted_score_zero_com:
             score_s = self._project_zero_com(score_s, batch_mask)
         if self.sde.kind == "vp":
-            return self.ode_step(xs, score_s, s=s, t=t, batch_mask=batch_mask, temperature=temperature)
+            if not stochastic:
+                return self.ode_step(xs, score_s, s=s, t=t, batch_mask=batch_mask, temperature=temperature)
+
+            # VP reverse SDE in our time convention (t=0 noisy -> t=1 clean).
+            # Internally, VP schedules are defined in forward time tau=1-t, and sampling
+            # from noisy->clean corresponds to tau decreasing.
+            # Euler-Maruyama update for a step tau_s -> tau_t (dtau = t - s):
+            #   x <- x - (f - g^2 * score) * dtau + g * sqrt(dtau) * z
+            # with forward drift f = -0.5 * beta(tau) * x and g^2 = beta(tau) * vp_sigma_scale^2.
+
+            # Ensure temperature is a torch tensor if provided.
+            if temperature is not None and not isinstance(temperature, torch.Tensor):
+                temperature = torch.as_tensor(temperature, device=s.device, dtype=s.dtype)
+            if isinstance(temperature, torch.Tensor):
+                temperature = temperature.to(device=s.device, dtype=s.dtype)
+
+            tau_s = self._tau(s)
+            beta0 = float(self.sde.beta_min)
+            beta1 = float(self.sde.beta_max)
+            beta = beta0 + (beta1 - beta0) * tau_s  # (B,1)
+
+            # Match alpha()/sigma() temperature scaling: scale beta by temperature.
+            if isinstance(temperature, torch.Tensor):
+                if temperature.numel() == 1:
+                    temperature = temperature.expand_as(beta)
+                beta = beta * torch.clamp(temperature, min=1e-6)
+
+            beta_node = beta[batch_mask]  # (N,1)
+            dt = (t - s)[batch_mask]  # (N,1)
+            dt = torch.clamp(dt, min=0.0)
+
+            vp_scale = float(self.sde.vp_sigma_scale)
+            g2_node = beta_node * (vp_scale * vp_scale)
+
+            # -f*dt = 0.5 * beta * x * dt; and +g^2*score*dt
+            drift = (0.5 * beta_node) * xs + g2_node * score_s
+
+            noise = torch.randn_like(xs)
+            if self.enforce_zero_com_noise:
+                noise = self._project_zero_com(noise, batch_mask)
+            g_node = torch.sqrt(torch.clamp(beta_node, min=0.0)) * vp_scale
+            diffusion = g_node * torch.sqrt(torch.clamp(dt, min=0.0)) * noise
+
+            return xs + drift * dt + diffusion
 
         sigma_s = self.sigma(s, temperature=temperature)[batch_mask]
         sigma_t = self.sigma(t, temperature=temperature)[batch_mask]

@@ -22,6 +22,63 @@ class RadiusMLPParams:
     # the boundary condition force_from_E = -∂E/∂x is meaningful.
     use_x_in_energy_force: bool = True
 
+    # Time-conditioning architecture.
+    # This is an internal backbone choice; existing call sites do not need to change.
+    time_emb_dim: int = 64
+
+
+class SinusoidalTimeEmbeddings(nn.Module):
+    """Standard sinusoidal embedding for a scalar time t (diffusion-style)."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        if dim <= 0:
+            raise ValueError("dim must be positive")
+        if dim % 2 != 0:
+            raise ValueError("dim must be even for sinusoidal embeddings")
+        self.dim = int(dim)
+
+    def forward(self, time: torch.Tensor) -> torch.Tensor:
+        # time: (..., 1) or (...,)
+        if time.ndim == 1:
+            time = time.unsqueeze(-1)
+        if time.shape[-1] != 1:
+            raise ValueError(f"time must have trailing dim 1; got {tuple(time.shape)}")
+
+        device = time.device
+        dtype = time.dtype
+
+        half_dim = self.dim // 2
+        if half_dim <= 1:
+            raise ValueError("dim must be >= 4 for stable sinusoidal frequencies")
+
+        # exp(-log(10000) * i/(half_dim-1))
+        exponent = -torch.log(torch.tensor(10000.0, device=device, dtype=dtype)) * (
+            torch.arange(half_dim, device=device, dtype=dtype) / float(half_dim - 1)
+        )
+        freqs = torch.exp(exponent)  # (half_dim,)
+
+        args = time * freqs.unsqueeze(0)  # (..., half_dim)
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+
+class TimeAwareResBlock(nn.Module):
+    """Residual MLP block with additive conditioning (time/temperature embedding)."""
+
+    def __init__(self, dim: int, cond_dim: int):
+        super().__init__()
+        self.act = nn.SiLU()
+        self.norm = nn.LayerNorm(dim)
+        self.linear1 = nn.Linear(dim, dim)
+        self.linear2 = nn.Linear(dim, dim)
+        self.cond_proj = nn.Linear(cond_dim, dim)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        h = self.linear1(self.act(self.norm(x)))
+        h = h + self.cond_proj(self.act(cond))
+        h = self.linear2(self.act(h))
+        return x + h
+
 
 def _make_mlp(in_dim: int, out_dim: int, hidden_dim: int, n_layers: int) -> nn.Sequential:
     layers = []
@@ -59,8 +116,35 @@ class RadiusMLPDynamics(nn.Module):
         if params.condition_temperature:
             in_dim += 1
 
+        # --- Time-conditioned residual backbone (keeps same I/O as the previous MLP) ---
+        time_emb_dim = int(getattr(params, "time_emb_dim", 64))
+        if time_emb_dim % 2 != 0:
+            # Keep it safe even if a user config sets an odd value.
+            time_emb_dim += 1
+        time_emb_dim = max(4, time_emb_dim)
+        self.cond_dim = time_emb_dim
+
+        self.input_proj = nn.Linear(in_dim, params.hidden_dim)
+
+        # Condition embedding combines (optional) time + temperature.
+        self.time_mlp = nn.Sequential(
+            SinusoidalTimeEmbeddings(time_emb_dim),
+            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, time_emb_dim),
+        )
+        self.temperature_mlp = nn.Sequential(
+            nn.Linear(1, time_emb_dim),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, time_emb_dim),
+        )
+
+        n_blocks = max(int(params.n_layers), 2)
+        self.blocks = nn.ModuleList([TimeAwareResBlock(params.hidden_dim, time_emb_dim) for _ in range(n_blocks)])
+        self.final_norm = nn.LayerNorm(params.hidden_dim)
+        self.final_act = nn.SiLU()
+
         # Simple per-atom heads
-        self.node_mlp = _make_mlp(in_dim, params.hidden_dim, params.hidden_dim, max(params.n_layers, 2))
         self.vel_head = _make_mlp(params.hidden_dim, x_dim, params.hidden_dim, 2)
         self.logits_h_head = _make_mlp(params.hidden_dim, atom_nf, params.hidden_dim, 2)
 
@@ -86,23 +170,40 @@ class RadiusMLPDynamics(nn.Module):
             if t is None:
                 raise ValueError("t is required when condition_time=True")
             if t.numel() == 1:
-                t_node = torch.full((h_atoms.size(0), 1), float(t.item()), device=h_atoms.device, dtype=h_atoms.dtype)
+                # Preserve autograd: avoid converting to Python float.
+                t_node = t.to(device=h_atoms.device, dtype=h_atoms.dtype).view(1, 1).expand(h_atoms.size(0), 1)
             else:
                 t_node = t[mask_atoms].to(h_atoms.dtype)
             feats = torch.cat([feats, t_node], dim=-1)
+        else:
+            t_node = None
 
         if self.params.condition_temperature:
             if temperature is None:
                 raise ValueError("temperature is required when condition_temperature=True")
             if temperature.numel() == 1:
-                temp_node = torch.full(
-                    (h_atoms.size(0), 1), float(temperature.item()), device=h_atoms.device, dtype=h_atoms.dtype
-                )
+                # Preserve autograd: avoid converting to Python float.
+                temp_node = temperature.to(device=h_atoms.device, dtype=h_atoms.dtype).view(1, 1).expand(h_atoms.size(0), 1)
             else:
                 temp_node = temperature[mask_atoms].to(h_atoms.dtype)
             feats = torch.cat([feats, temp_node], dim=-1)
+        else:
+            temp_node = None
 
-        h = self.node_mlp(feats)
+        # Backbone
+        h = self.input_proj(feats)
+
+        # Build conditioning embedding (always present for simplicity).
+        # If a condition is disabled, it contributes zeros.
+        cond = torch.zeros((h.size(0), self.cond_dim), device=h.device, dtype=h.dtype)
+        if self.params.condition_time:
+            cond = cond + self.time_mlp(t_node)
+        if self.params.condition_temperature:
+            cond = cond + self.temperature_mlp(temp_node)
+
+        for block in self.blocks:
+            h = block(h, cond)
+        h = self.final_act(self.final_norm(h))
 
         # Predict velocity in the same coordinate frame as x_atoms
         vel = self.vel_head(h)

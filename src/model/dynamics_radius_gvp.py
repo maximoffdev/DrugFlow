@@ -9,6 +9,7 @@ from torch_scatter import scatter_mean
 
 from src.model.gvp import GVPModel
 from src.model.graph_builders import build_batched_biknn_edges, build_batched_fully_connected_edges
+from src.model.dynamics_radius_mlp import SinusoidalTimeEmbeddings
 
 
 @dataclass(frozen=True)
@@ -20,9 +21,17 @@ class RadiusGVPParams:
     condition_time: bool = True
     condition_temperature: bool = True
 
+    # Conditioning architecture (diffusion-style)
+    time_emb_dim: int = 64
+
     # Radius graph
     edge_cutoff_ligand: float | None = None
     knn_k: int = 30
+
+    # Graph construction
+    #  - "biknn": biKNN + cutoff radius graph (default)
+    #  - "fc": fully-connected within each molecule (no self loops)
+    graph_kind: str = "biknn"
 
     # GVP backbone params (match DrugFlow configs)
     n_layers: int = 5
@@ -62,8 +71,34 @@ class RadiusGVPDynamics(nn.Module):
             nn.Linear(params.hidden_scalar_nf, params.hidden_scalar_nf),
         )
 
-        extra = (1 if params.condition_time else 0) + (1 if params.condition_temperature else 0)
-        node_in_scalar = params.hidden_scalar_nf + extra
+        # Diffusion-style conditioning embedding.
+        # Keep this internal to the dynamics module; call sites only pass scalars t/temperature.
+        self.cond_dim = 0
+        if params.condition_time or params.condition_temperature:
+            time_emb_dim = int(getattr(params, "time_emb_dim", 64))
+            if time_emb_dim % 2 != 0:
+                time_emb_dim += 1
+            time_emb_dim = max(4, time_emb_dim)
+            self.cond_dim = time_emb_dim
+
+        self.time_mlp = None
+        if params.condition_time:
+            self.time_mlp = nn.Sequential(
+                SinusoidalTimeEmbeddings(self.cond_dim),
+                nn.Linear(self.cond_dim, self.cond_dim),
+                nn.SiLU(),
+                nn.Linear(self.cond_dim, self.cond_dim),
+            )
+
+        self.temperature_mlp = None
+        if params.condition_temperature:
+            self.temperature_mlp = nn.Sequential(
+                nn.Linear(1, self.cond_dim),
+                nn.SiLU(),
+                nn.Linear(self.cond_dim, self.cond_dim),
+            )
+
+        node_in_scalar = params.hidden_scalar_nf + self.cond_dim
 
         self.net = GVPModel(
             node_in_dim=(node_in_scalar, 0),
@@ -99,11 +134,12 @@ class RadiusGVPDynamics(nn.Module):
         # If no cutoff is provided, treat as effectively infinite.
         cutoff = float(self.params.edge_cutoff_ligand) if self.params.edge_cutoff_ligand is not None else 1e9
 
-        # Old behavior (biKNN radius graph):
-        # return build_batched_biknn_edges(x, batch_mask, cutoff=cutoff, k=int(self.params.knn_k))
-
-        # New behavior: fully-connected graph within each molecule (no self-loops).
-        return build_batched_fully_connected_edges(x, batch_mask, cutoff=cutoff, k=int(self.params.knn_k))
+        graph_kind = str(getattr(self.params, "graph_kind", "biknn")).lower()
+        if graph_kind in {"fc", "fully_connected", "fully-connected"}:
+            return build_batched_fully_connected_edges(x, batch_mask, cutoff=cutoff, k=int(self.params.knn_k))
+        if graph_kind in {"biknn", "knn", "radius"}:
+            return build_batched_biknn_edges(x, batch_mask, cutoff=cutoff, k=int(self.params.knn_k))
+        raise ValueError(f"Unknown graph_kind={graph_kind!r}; expected 'biknn' or 'fc'")
 
     def forward(
         self,
@@ -119,23 +155,36 @@ class RadiusGVPDynamics(nn.Module):
         # Node scalars
         h = self.atom_encoder(h_atoms)
 
+        # Conditioning embedding (time/temperature). If disabled, it contributes zeros.
+        if self.cond_dim > 0:
+            cond = torch.zeros((h.size(0), self.cond_dim), device=h.device, dtype=h.dtype)
+        else:
+            cond = None
+
         if self.params.condition_time:
             if t is None:
                 raise ValueError("t is required when condition_time=True")
             if t.numel() == 1:
-                t_node = torch.full((h.size(0), 1), float(t.item()), device=h.device, dtype=h.dtype)
+                # Preserve autograd: avoid converting to Python float.
+                t_node = t.to(device=h.device, dtype=h.dtype).view(1, 1).expand(h.size(0), 1)
             else:
                 t_node = t[mask_atoms].to(h.dtype)
-            h = torch.cat([h, t_node], dim=-1)
+            if cond is not None and self.time_mlp is not None:
+                cond = cond + self.time_mlp(t_node)
 
         if self.params.condition_temperature:
             if temperature is None:
                 raise ValueError("temperature is required when condition_temperature=True")
             if temperature.numel() == 1:
-                temp_node = torch.full((h.size(0), 1), float(temperature.item()), device=h.device, dtype=h.dtype)
+                # Preserve autograd: avoid converting to Python float.
+                temp_node = temperature.to(device=h.device, dtype=h.dtype).view(1, 1).expand(h.size(0), 1)
             else:
                 temp_node = temperature[mask_atoms].to(h.dtype)
-            h = torch.cat([h, temp_node], dim=-1)
+            if cond is not None and self.temperature_mlp is not None:
+                cond = cond + self.temperature_mlp(temp_node)
+
+        if cond is not None:
+            h = torch.cat([h, cond], dim=-1)
 
         edges = self._build_edges(x_atoms, mask_atoms)
 
