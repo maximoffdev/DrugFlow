@@ -698,6 +698,43 @@ class CoordScoreDiffusion:
             return scatter_add(loss, batch_mask, dim=0)
         return loss
 
+    # def score_loss(
+    #     self,
+    #     force_pred: torch.Tensor,
+    #     x_clean: torch.Tensor,
+    #     xt: torch.Tensor,
+    #     t: torch.Tensor,
+    #     batch_mask: torch.Tensor,
+    #     reduce: str = "mean",
+    #     temperature=None,
+    #     weight_by_sigma: bool = False,
+    # ) -> torch.Tensor:
+    #     """Denoising score matching loss.
+
+    #     If `weight_by_sigma` is True, uses a common VE weighting: multiply by sigma(t)^2.
+    #     """
+
+    #     score_pred = force_pred
+    #     if self.project_predicted_score_zero_com:
+    #         score_pred = self._project_zero_com(score_pred, batch_mask)
+        
+    #     target = self.score_target(xt, x_clean, t, batch_mask, temperature=temperature)
+    #     per_node = torch.sum((score_pred - target) ** 2, dim=-1)
+
+    #     if weight_by_sigma:
+    #         # print("per npde before sigma weighting: ", per_node.mean().item(), per_node.std().item())
+    #         sigma_t = self.sigma(t, temperature=temperature)[batch_mask].squeeze(-1)
+    #         per_node = per_node * (sigma_t * sigma_t)
+    #     #     print("sigma_t:", sigma_t.mean().item(), sigma_t.std().item())
+    #     # print("Score Loss Stats: ", per_node.mean().item(), per_node.std().item())
+
+    #     # print("True Score Stats: ", target.mean().item(), target.std().item())
+    #     # print("Pred Score Stats: ", score_pred.mean().item(), score_pred.std().item())
+    #     # print()
+
+    #     return self.reduce_loss(per_node, batch_mask, reduce)
+
+    # score loss with min-SNR implementation from https://arxiv.org/html/2303.09556v3
     def score_loss(
         self,
         force_pred: torch.Tensor,
@@ -708,10 +745,13 @@ class CoordScoreDiffusion:
         reduce: str = "mean",
         temperature=None,
         weight_by_sigma: bool = False,
+        use_min_snr: bool = False,  # [New Flag]
+        min_snr_gamma: float = 5.0, # [New Param] Default from paper [cite: 329]
     ) -> torch.Tensor:
         """Denoising score matching loss.
 
         If `weight_by_sigma` is True, uses a common VE weighting: multiply by sigma(t)^2.
+        If `use_min_snr` is True, applies Min-SNR weighting strategy to clamp high-SNR gradients.
         """
 
         score_pred = force_pred
@@ -722,15 +762,22 @@ class CoordScoreDiffusion:
         per_node = torch.sum((score_pred - target) ** 2, dim=-1)
 
         if weight_by_sigma:
-            # print("per npde before sigma weighting: ", per_node.mean().item(), per_node.std().item())
             sigma_t = self.sigma(t, temperature=temperature)[batch_mask].squeeze(-1)
-            per_node = per_node * (sigma_t * sigma_t)
-        #     print("sigma_t:", sigma_t.mean().item(), sigma_t.std().item())
-        # print("Score Loss Stats: ", per_node.mean().item(), per_node.std().item())
-
-        # print("True Score Stats: ", target.mean().item(), target.std().item())
-        # print("Pred Score Stats: ", score_pred.mean().item(), score_pred.std().item())
-        # print()
+            
+            if use_min_snr:
+                # Calculate SNR. Assuming VE SDE where alpha=1, SNR = 1/sigma^2
+                # Min-SNR-gamma strategy: w_t = min(SNR, gamma) for x0 loss.
+                # This translates to min(1, gamma * sigma^2) scaling for noise/score loss.
+                # snr = 1.0 / (sigma_t ** 2 + 1e-8) # Add epsilon for stability
+                
+                # The effective weight is sigma^2 * min(1, gamma / SNR)
+                # Which simplifies to sigma^2 * min(1, gamma * sigma^2)
+                # Or effectively: min(sigma^2, gamma * sigma^4)
+                min_snr_modifier = torch.clamp(min_snr_gamma * (sigma_t ** 2), max=1.0)
+                per_node = per_node * (sigma_t * sigma_t) * min_snr_modifier                
+            else:
+                # Standard Variance Exploding weighting (equivalent to SNR weighting on x0)
+                per_node = per_node * (sigma_t * sigma_t)
 
         return self.reduce_loss(per_node, batch_mask, reduce)
 
@@ -843,9 +890,12 @@ class CoordScoreDiffusion:
         reduce: str = "mean",
         divergence: Literal["exact", "hutchinson"] = "hutchinson",
         n_trace_samples: int = 1,
+        trace_batch_size: int | None = None,
         enable_higher_order: bool = True,
+        divergence_create_graph: bool | None = None,
         compute_hjb: bool = True,
         compute_consistency: bool = True,
+        debug: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute HJB residual loss + force/energy consistency.
 
@@ -855,13 +905,31 @@ class CoordScoreDiffusion:
         Returns:
           loss_hjb: shape (B,) mean-squared HJB residual per example
           loss_consistency: shape (B,) mean-squared (F + ∇_x u) per example
+
+                Notes:
+                    - If `enable_higher_order=True`, the default behavior is to also differentiate
+                        through the divergence estimate (higher-order derivatives). This can be slow
+                        and noisy.
+                    - Set `divergence_create_graph=False` to compute div(F) with stop-grad
+                        (i.e. no gradients flow through the divergence term) while still allowing
+                        higher-order gradients for other terms.
+                    - `trace_batch_size` chunks Hutchinson samples to reduce peak memory.
         """
         assert reduce in {"mean", "sum", "none"}
 
         if int(n_trace_samples) <= 0:
             raise ValueError(f"n_trace_samples must be >= 1; got {n_trace_samples}")
 
+        if trace_batch_size is not None:
+            trace_batch_size = int(trace_batch_size)
+            if trace_batch_size <= 0:
+                raise ValueError(f"trace_batch_size must be >= 1 or None; got {trace_batch_size}")
+
         create_graph = bool(enable_higher_order)
+        if divergence_create_graph is None:
+            div_create_graph = create_graph
+        else:
+            div_create_graph = bool(divergence_create_graph)
 
         B = int(batch_mask.max().item()) + 1 if batch_mask.numel() > 0 else 0
         if B == 0:
@@ -928,7 +996,7 @@ class CoordScoreDiffusion:
                     grad_Fi = torch.autograd.grad(
                         outputs=F_pred[:, i].sum(),
                         inputs=x,
-                        create_graph=create_graph,
+                        create_graph=div_create_graph,
                         retain_graph=retain,
                         allow_unused=False,
                     )[0]
@@ -938,27 +1006,72 @@ class CoordScoreDiffusion:
             elif divergence == "hutchinson":
                 # Hutchinson trace estimator:
                 #   tr(J) = E_v [ v^T J v ] for Rademacher v.
-                # We compute v^T J v using a single VJP: grad_x (sum_i F_i(x) v_i) = J^T v.
-                div_F_accum = torch.zeros((B,), device=x.device, dtype=x.dtype)
+                # We compute v^T J v using a VJP: autograd.grad(F(x), x, grad_outputs=v) = J^T v.
+                # For multiple trace samples, we batch VJPs in one call using is_grads_batched=True
+                # (falls back to a loop if the local torch version doesn't support it).
                 n_samples = int(n_trace_samples)
-                for s_idx in range(n_samples):
-                    v = torch.empty_like(x).bernoulli_(0.5)
-                    v = v.mul_(2.0).add_(-1.0)
 
-                    scalar = torch.sum(F_pred * v)
-                    # If training with higher-order grads, retain for outer backward.
-                    # Otherwise, only retain if we will take another trace sample.
-                    retain = True if create_graph else (s_idx < n_samples - 1)
-                    Jt_v = torch.autograd.grad(
-                        outputs=scalar,
-                        inputs=x,
-                        create_graph=create_graph,
-                        retain_graph=retain,
-                        allow_unused=False,
-                    )[0]
-                    div_node = torch.sum(Jt_v * v, dim=-1)
-                    div_F_accum = div_F_accum + scatter_add(div_node, batch_mask, dim=0)
-                div_F = div_F_accum / float(n_samples)
+                # Chunked Hutchinson estimation to reduce peak memory.
+                # We accumulate the *sum* over trace samples and divide once at the end.
+                div_F_sum = torch.zeros((B,), device=x.device, dtype=x.dtype)
+
+                def _rademacher_antithetic(num: int) -> torch.Tensor:
+                    """Return Rademacher vectors with antithetic pairing when possible.
+
+                    Shape: (num, N, D)
+                    """
+                    if num == 1:
+                        v_local = torch.empty((1,) + x.shape, device=x.device, dtype=x.dtype).bernoulli_(0.5)
+                        return v_local.mul_(2.0).add_(-1.0)
+                    half = num // 2
+                    v_half = torch.empty((half,) + x.shape, device=x.device, dtype=x.dtype).bernoulli_(0.5)
+                    v_half = v_half.mul_(2.0).add_(-1.0)
+                    v_local = torch.cat([v_half, -v_half], dim=0)
+                    if num % 2 == 1:
+                        v_extra = torch.empty((1,) + x.shape, device=x.device, dtype=x.dtype).bernoulli_(0.5)
+                        v_extra = v_extra.mul_(2.0).add_(-1.0)
+                        v_local = torch.cat([v_local, v_extra], dim=0)
+                    return v_local
+
+                remaining = n_samples
+                while remaining > 0:
+                    this_bs = remaining if trace_batch_size is None else min(trace_batch_size, remaining)
+                    remaining -= this_bs
+
+                    v = _rademacher_antithetic(this_bs)
+
+                    try:
+                        Jt_v = torch.autograd.grad(
+                            outputs=F_pred,
+                            inputs=x,
+                            grad_outputs=v,
+                            create_graph=div_create_graph,
+                            retain_graph=True if create_graph else False,
+                            allow_unused=False,
+                            is_grads_batched=True,
+                        )[0]
+
+                        # div_node_sum: (N,) sum over samples in this chunk
+                        div_node_sum = torch.sum(Jt_v * v, dim=-1).sum(dim=0)
+                        div_F_sum = div_F_sum + scatter_add(div_node_sum, batch_mask, dim=0)
+
+                    except TypeError:
+                        # Older PyTorch without is_grads_batched; fall back to a loop.
+                        for s_idx in range(this_bs):
+                            v_s = v[s_idx]
+                            retain = True if create_graph else (remaining > 0 or s_idx < this_bs - 1)
+                            Jt_v_s = torch.autograd.grad(
+                                outputs=F_pred,
+                                inputs=x,
+                                grad_outputs=v_s,
+                                create_graph=div_create_graph,
+                                retain_graph=retain,
+                                allow_unused=False,
+                            )[0]
+                            div_node = torch.sum(Jt_v_s * v_s, dim=-1)
+                            div_F_sum = div_F_sum + scatter_add(div_node, batch_mask, dim=0)
+
+                div_F = div_F_sum / float(n_samples)
 
             else:
                 raise ValueError(f"Unknown divergence mode: {divergence}")
@@ -1002,17 +1115,40 @@ class CoordScoreDiffusion:
         else:
             loss_consistency = torch.zeros((B,), device=x.device, dtype=x.dtype)
             
-        # Create a single string with labels
-        status_msg = (
-            f"du_dt: {du_dt.mean():.4f} | "
-            f"F_dot_f: {F_dot_f.mean():.4f} | "
-            f"Term3: {torch.mean(0.5 * g2 * F_norm2 / temp_denom):.4f} | "
-            f"div_f: {div_f.mean():.4f} | "
-            f"Term5: {torch.mean(0.5 * g2 * div_F / temp_denom):.4f}"
-        )
-
-        # Print with end='\r' to return to the start of the line instead of a new line
-        print(status_msg, end='\r')
+        if debug:
+            mem_str = ""
+            if x.is_cuda and torch.cuda.is_available():
+                try:
+                    dev = x.device
+                    alloc_mb = torch.cuda.memory_allocated(dev) / (1024.0 ** 2)
+                    reserv_mb = torch.cuda.memory_reserved(dev) / (1024.0 ** 2)
+                    max_alloc_mb = torch.cuda.max_memory_allocated(dev) / (1024.0 ** 2)
+                    max_reserv_mb = torch.cuda.max_memory_reserved(dev) / (1024.0 ** 2)
+                    props = torch.cuda.get_device_properties(0)
+                    mem_str = (
+                        f"CUDA MB alloc/resv: {alloc_mb:.0f}/{reserv_mb:.0f} | "
+                        f"max alloc/resv: {max_alloc_mb:.0f}/{max_reserv_mb:.0f} | "
+                        f"total MB: {props.total_memory / (1024**2):.0f} | "
+                    )
+                except Exception:
+                    mem_str = ""
+            flag_str = (
+                f"Divergence Mode: {divergence} | "
+                f"n_trace_samples: {n_trace_samples} | "
+                f"trace_batch_size: {trace_batch_size} | "
+                f"enable_higher_order: {enable_higher_order} | "
+                f"divergence_create_graph: {divergence_create_graph} |"
+            )
+            status_msg = (
+                f"du_dt: {du_dt.mean():.4f} | "
+                f"F_dot_f: {F_dot_f.mean():.4f} | "
+                f"Term3: {torch.mean(0.5 * g2 * F_norm2 / temp_denom):.4f} | "
+                f"div_f: {div_f.mean():.4f} | "
+                f"Term5: {torch.mean(0.5 * g2 * div_F / temp_denom):.4f} |"
+                f"{mem_str}"
+                f"{flag_str}"
+            )
+            print(status_msg, end="\r")
 
         if reduce == "none":
             return loss_hjb, loss_consistency
@@ -1021,7 +1157,9 @@ class CoordScoreDiffusion:
         # print("force true Stats: ", -du_dx.mean().item(), (-du_dx).std().item())
 
         # Keep per-example shape (B,) for compatibility; reduce only affects node aggregation above.
-        return loss_hjb, loss_consistency
+        # return loss_hjb, loss_consistency
+        return self.reduce_loss(loss_hjb, batch_mask, reduce), self.reduce_loss(loss_consistency, batch_mask, reduce)
+
 
     def reverse_step(
         self,

@@ -181,10 +181,13 @@ class EnergyForceDiffusion(pl.LightningModule):
         set_default(simulation_params, "enforce_zero_com_noise", False)
         set_default(simulation_params, "project_predicted_force_zero_com", False)
         set_default(loss_params, "x_score_weight_by_sigma", False)
+        set_default(loss_params, "use_min_snr", False)
+        set_default(loss_params, "min_snr_gamma", 5.0)
         # HJB settings (divergence estimator + higher-order autodiff)
-        set_default(loss_params, "hjb_divergence", "hutchinson")
-        set_default(loss_params, "hjb_trace_samples", 1)
-        set_default(loss_params, "hjb_enable_higher_order", True)
+        # set_default(loss_params, "hjb_divergence", "hutchinson")
+        # set_default(loss_params, "hjb_trace_samples", 1)
+        # set_default(loss_params, "hjb_enable_higher_order", True)
+        # set_default(loss_params, "hjb_divergence_create_graph", True)
 
         coord_sde = SDEParams(
             kind=cast(Literal["ve", "vp"], str(simulation_params.coord_sde_kind)),
@@ -205,6 +208,8 @@ class EnergyForceDiffusion(pl.LightningModule):
         )
         self.module_h = UniformPriorMarkovBridge(self.atom_nf, loss_type=loss_params.discrete_loss)
         self.x_score_weight_by_sigma = bool(loss_params.x_score_weight_by_sigma)
+        self.use_min_snr = bool(loss_params.use_min_snr)
+        self.min_snr_gamma = float(loss_params.min_snr_gamma)
 
         # Optional score-based diffusion on atom types via logit space.
         # This is for sampling support (requested); training remains Markov bridge for now.
@@ -306,6 +311,9 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.hjb_divergence = str(getattr(loss_params, "hjb_divergence", "hutchinson"))
         self.hjb_trace_samples = int(getattr(loss_params, "hjb_trace_samples", 1))
         self.hjb_enable_higher_order = bool(getattr(loss_params, "hjb_enable_higher_order", True))
+        self.hjb_divergence_create_graph = bool(getattr(loss_params, "hjb_divergence_create_graph", True))
+        self.hjb_trace_batch_size = int(getattr(loss_params, "hjb_trace_batch_size", 1))
+        self.hjb_debug = bool(getattr(loss_params, "hjb_debug", False))
         if self.hjb_divergence not in {"exact", "hutchinson"}:
             raise ValueError("loss_params.hjb_divergence must be one of: exact, hutchinson")
         if self.hjb_trace_samples <= 0:
@@ -590,6 +598,9 @@ class EnergyForceDiffusion(pl.LightningModule):
         # Only train with higher-order autodiff; during eval we can compute the residuals
         # with create_graph=False to avoid massive memory usage.
         enable_higher_order = bool(self.hjb_enable_higher_order and self.training)
+        divergence_create_graph = bool(self.hjb_divergence_create_graph and self.training)
+        trace_batch_size = int(self.hjb_trace_batch_size) if enable_higher_order else 1
+        hjb_debug = bool(self.hjb_debug and self.training)
 
         grad_ctx = nullcontext()
         if need_time_space_grads and (not torch.is_grad_enabled()):
@@ -633,6 +644,8 @@ class EnergyForceDiffusion(pl.LightningModule):
                 reduce=self.loss_reduce,
                 temperature=temperature,
                 weight_by_sigma=self.x_score_weight_by_sigma,
+                use_min_snr=self.use_min_snr,
+                min_snr_gamma=self.min_snr_gamma
             )
         else:
             loss_x = torch.zeros((ligand["size"].size(0),), device=ligand["x"].device, dtype=ligand["x"].dtype)
@@ -720,7 +733,7 @@ class EnergyForceDiffusion(pl.LightningModule):
                 raise ValueError(
                     f"energy_pred(t=0) must have shape (B,), got {tuple(energy_pred_t0.shape)} vs expected {tuple(loss_x.shape)}"
                 )
-            loss_energy_t0 = energy_pred_t0 ** 2
+            loss_energy_t0 = (energy_pred_t0 - (5.4 + 0.127 * torch.randn_like(energy_pred_t0))) ** 2
 
         ######## HJB loss + consistency condition at the *noisy* state (zt_x, t). ########
 
@@ -745,8 +758,11 @@ class EnergyForceDiffusion(pl.LightningModule):
                     divergence=cast(Literal["exact", "hutchinson"], self.hjb_divergence),
                     n_trace_samples=self.hjb_trace_samples,
                     enable_higher_order=enable_higher_order,
+                    divergence_create_graph=divergence_create_graph,
+                    trace_batch_size=trace_batch_size,
                     compute_hjb=float(self.lambda_hjb) > 0.0,
                     compute_consistency=float(self.lambda_consistency) > 0.0,
+                    debug=hjb_debug
                 )
 
         loss = (

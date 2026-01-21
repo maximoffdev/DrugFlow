@@ -99,6 +99,17 @@ if __name__ == "__main__":
 
     args = merge_args_and_yaml(args, config)
 
+    print(
+        "[train] run_name=", args.run_name,
+        " out_dir=", out_dir,
+        " max_epochs=", getattr(args.train_params, "n_epochs", None),
+        " resume=", args.resume,
+        " backoff=", args.backoff,
+        " finetune=", args.finetune,
+        " ckpt_path=", str(ckpt_path) if ckpt_path is not None else None,
+        flush=True,
+    )
+
     if args.debug:
         print('DEBUG MODE')
         args.wandb_params.mode = 'disabled'
