@@ -821,6 +821,14 @@ class CoordScoreDiffusion:
 
         raise ValueError(f"Unknown SDE kind: {self.sde.kind}")
 
+    def _g_t(self, t):
+        # g(t) = sigma(t) * sqrt(2 * (log(sigma_max) - log(sigma_min)))
+        # This ensures the marginal distribution is roughly N(x, sigma(t)^2)
+        # t = 1.0 - t
+        sigma_t = float(self.sde.sigma_min) * (float(self.sde.sigma_max) / float(self.sde.sigma_min)) ** t
+        log_ratio = math.log(float(self.sde.sigma_max)) - math.log(float(self.sde.sigma_min))
+        return (sigma_t * math.sqrt(2.0 * log_ratio)).view(-1)
+
     def _sde_f_forward(
         self,
         x: torch.Tensor,
@@ -880,7 +888,7 @@ class CoordScoreDiffusion:
     
     def hjb_loss(
         self,
-        force_pred: torch.Tensor,
+        v_pred: torch.Tensor,
         energy_pred: torch.Tensor,
         x: torch.Tensor,
         t: torch.Tensor,
@@ -888,7 +896,7 @@ class CoordScoreDiffusion:
         *,
         temperature: torch.Tensor | float | None = None,
         reduce: str = "mean",
-        divergence: Literal["exact", "hutchinson"] = "hutchinson",
+        divergence: Literal["exact", "hutchinson"] = "exact",
         n_trace_samples: int = 1,
         trace_batch_size: int | None = None,
         enable_higher_order: bool = True,
@@ -897,23 +905,23 @@ class CoordScoreDiffusion:
         compute_consistency: bool = True,
         debug: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute HJB residual loss + force/energy consistency.
+        """Flow-matching PDE losses: continuity equation + constitutive relation.
 
-        This is meant to be called with `energy_pred` and `force_pred` computed from a
-        dynamics model where `x` and `t` were created with `requires_grad_(True)`.
+        This is meant to be called with `energy_pred` (scalar per-example) and `v_pred`
+        (vector per-node) computed from a flow-matching dynamics model where `x` and `t`
+        were created with `requires_grad_(True)`.
 
-        Returns:
-          loss_hjb: shape (B,) mean-squared HJB residual per example
-          loss_consistency: shape (B,) mean-squared (F + ∇_x u) per example
+        Implements (per example):
+          - Continuity equation for density proportional to exp(-u):
+              du/dt + v·∇u - div(v) = 0
+          - Constitutive relation tying velocity to SDE coefficients and energy gradient:
+              v = f(x,tau) - 0.5 * g(tau)^2 * ∇u / T
 
-                Notes:
-                    - If `enable_higher_order=True`, the default behavior is to also differentiate
-                        through the divergence estimate (higher-order derivatives). This can be slow
-                        and noisy.
-                    - Set `divergence_create_graph=False` to compute div(F) with stop-grad
-                        (i.e. no gradients flow through the divergence term) while still allowing
-                        higher-order gradients for other terms.
-                    - `trace_batch_size` chunks Hutchinson samples to reduce peak memory.
+        Notes:
+          - We evaluate SDE coefficients in forward diffusion time tau = 1 - t (tau=0 clean).
+          - The `compute_hjb` flag controls continuity loss computation.
+          - The `compute_consistency` flag controls constitutive-relation loss computation.
+          - `trace_batch_size` chunks Hutchinson trace samples to reduce peak memory.
         """
         assert reduce in {"mean", "sum", "none"}
 
@@ -936,9 +944,9 @@ class CoordScoreDiffusion:
             empty = torch.empty((0,), device=x.device, dtype=x.dtype)
             return empty, empty
 
-        F_pred = force_pred
+        V_pred = v_pred
         if self.project_predicted_score_zero_com:
-            F_pred = self._project_zero_com(F_pred, batch_mask)
+            V_pred = self._project_zero_com(V_pred, batch_mask)
         u_pred = energy_pred.view(-1)
         if u_pred.numel() != B:
             raise ValueError(f"energy_pred must have shape (B,), got {tuple(energy_pred.shape)}")
@@ -957,13 +965,13 @@ class CoordScoreDiffusion:
 
         tau = self._tau(t)
 
-        # We evaluate SDE coefficients using diffusion forward-time tau = 1 - t.
-        # The network was evaluated at `t`, so to obtain du/dtau we use the chain rule:
-        #   tau = 1 - t  =>  du/dtau = -du/dt.
-        du_dx = None
-        if compute_hjb:
-            # If enable_higher_order=True we keep retain_graph=True to ensure the outer backward
-            # can backpropagate through these autograd.grad calls.
+        # Gradients of u w.r.t. time and space.
+        # For the continuity equation we need du/dt, du/dx, and div(v).
+        # For the constitutive relation we need du/dx.
+        need_du_dt = bool(compute_hjb)
+        need_du_dx = bool(compute_hjb or compute_consistency)
+
+        if need_du_dt:
             du_dt = torch.autograd.grad(
                 outputs=u_pred.sum(),
                 inputs=t,
@@ -971,97 +979,81 @@ class CoordScoreDiffusion:
                 retain_graph=True,
                 allow_unused=False,
             )[0]
-            du_dt = -du_dt.view(-1)    # du/dtau
+            du_dt = du_dt.view(-1)
+        else:
+            du_dt = torch.zeros((B,), device=x.device, dtype=x.dtype)
 
-            # If we also need the consistency term, compute ∇_x u *before* the divergence
-            # computation. In eval/logging mode (create_graph=False) the divergence autograd.grad
-            # would otherwise free the shared forward graph and break this subsequent grad call.
-            if compute_consistency:
-                du_dx = torch.autograd.grad(
-                    outputs=u_pred.sum(),
-                    inputs=x,
-                    create_graph=create_graph,
-                    retain_graph=True,
-                    allow_unused=False,
-                )[0]
+        if need_du_dx:
+            du_dx = torch.autograd.grad(
+                outputs=u_pred.sum(),
+                inputs=x,
+                create_graph=create_graph,
+                retain_graph=True,
+                allow_unused=False,
+            )[0]
+        else:
+            du_dx = torch.zeros_like(x)
 
-            # div(F) = trace(dF/dx)
-            # Exact computation is expensive (and memory-heavy). Hutchinson estimator is the default.
+        # div(v) = trace(dv/dx)
+        if compute_hjb:
             if divergence == "exact":
-                div_F_node = torch.zeros((x.size(0),), device=x.device, dtype=x.dtype)
+                div_v_node = torch.zeros((x.size(0),), device=x.device, dtype=x.dtype)
                 for i in range(x.size(-1)):
-                    # If training with higher-order grads, retain for outer backward.
-                    # Otherwise, only retain until the final component.
                     retain = True if create_graph else (i < x.size(-1) - 1)
-                    grad_Fi = torch.autograd.grad(
-                        outputs=F_pred[:, i].sum(),
+                    grad_vi = torch.autograd.grad(
+                        outputs=V_pred[:, i].sum(),
                         inputs=x,
                         create_graph=div_create_graph,
                         retain_graph=retain,
                         allow_unused=False,
                     )[0]
-                    div_F_node = div_F_node + grad_Fi[:, i]
-                div_F = scatter_add(div_F_node, batch_mask, dim=0)
+                    div_v_node = div_v_node + grad_vi[:, i]
+                div_v = scatter_add(div_v_node, batch_mask, dim=0)
 
             elif divergence == "hutchinson":
-                # Hutchinson trace estimator:
-                #   tr(J) = E_v [ v^T J v ] for Rademacher v.
-                # We compute v^T J v using a VJP: autograd.grad(F(x), x, grad_outputs=v) = J^T v.
-                # For multiple trace samples, we batch VJPs in one call using is_grads_batched=True
-                # (falls back to a loop if the local torch version doesn't support it).
                 n_samples = int(n_trace_samples)
-
-                # Chunked Hutchinson estimation to reduce peak memory.
-                # We accumulate the *sum* over trace samples and divide once at the end.
-                div_F_sum = torch.zeros((B,), device=x.device, dtype=x.dtype)
+                div_v_sum = torch.zeros((B,), device=x.device, dtype=x.dtype)
 
                 def _rademacher_antithetic(num: int) -> torch.Tensor:
-                    """Return Rademacher vectors with antithetic pairing when possible.
-
-                    Shape: (num, N, D)
-                    """
                     if num == 1:
-                        v_local = torch.empty((1,) + x.shape, device=x.device, dtype=x.dtype).bernoulli_(0.5)
-                        return v_local.mul_(2.0).add_(-1.0)
+                        vv = torch.empty((1,) + x.shape, device=x.device, dtype=x.dtype).bernoulli_(0.5)
+                        return vv.mul_(2.0).add_(-1.0)
                     half = num // 2
                     v_half = torch.empty((half,) + x.shape, device=x.device, dtype=x.dtype).bernoulli_(0.5)
                     v_half = v_half.mul_(2.0).add_(-1.0)
-                    v_local = torch.cat([v_half, -v_half], dim=0)
+                    vv = torch.cat([v_half, -v_half], dim=0)
                     if num % 2 == 1:
                         v_extra = torch.empty((1,) + x.shape, device=x.device, dtype=x.dtype).bernoulli_(0.5)
                         v_extra = v_extra.mul_(2.0).add_(-1.0)
-                        v_local = torch.cat([v_local, v_extra], dim=0)
-                    return v_local
+                        vv = torch.cat([vv, v_extra], dim=0)
+                    return vv
 
                 remaining = n_samples
                 while remaining > 0:
-                    this_bs = remaining if trace_batch_size is None else min(trace_batch_size, remaining)
+                    this_bs = remaining if trace_batch_size is None else min(int(trace_batch_size), remaining)
                     remaining -= this_bs
 
-                    v = _rademacher_antithetic(this_bs)
-
+                    v_trace = _rademacher_antithetic(this_bs)
                     try:
                         Jt_v = torch.autograd.grad(
-                            outputs=F_pred,
+                            outputs=V_pred,
                             inputs=x,
-                            grad_outputs=v,
+                            grad_outputs=v_trace,
                             create_graph=div_create_graph,
                             retain_graph=True if create_graph else False,
                             allow_unused=False,
                             is_grads_batched=True,
                         )[0]
 
-                        # div_node_sum: (N,) sum over samples in this chunk
-                        div_node_sum = torch.sum(Jt_v * v, dim=-1).sum(dim=0)
-                        div_F_sum = div_F_sum + scatter_add(div_node_sum, batch_mask, dim=0)
+                        div_node_sum = torch.sum(Jt_v * v_trace, dim=-1).sum(dim=0)
+                        div_v_sum = div_v_sum + scatter_add(div_node_sum, batch_mask, dim=0)
 
                     except TypeError:
-                        # Older PyTorch without is_grads_batched; fall back to a loop.
                         for s_idx in range(this_bs):
-                            v_s = v[s_idx]
+                            v_s = v_trace[s_idx]
                             retain = True if create_graph else (remaining > 0 or s_idx < this_bs - 1)
                             Jt_v_s = torch.autograd.grad(
-                                outputs=F_pred,
+                                outputs=V_pred,
                                 inputs=x,
                                 grad_outputs=v_s,
                                 create_graph=div_create_graph,
@@ -1069,51 +1061,40 @@ class CoordScoreDiffusion:
                                 allow_unused=False,
                             )[0]
                             div_node = torch.sum(Jt_v_s * v_s, dim=-1)
-                            div_F_sum = div_F_sum + scatter_add(div_node, batch_mask, dim=0)
+                            div_v_sum = div_v_sum + scatter_add(div_node, batch_mask, dim=0)
 
-                div_F = div_F_sum / float(n_samples)
+                div_v = div_v_sum / float(n_samples)
 
             else:
                 raise ValueError(f"Unknown divergence mode: {divergence}")
         else:
-            du_dt = torch.zeros((B,), device=x.device, dtype=x.dtype)
-            div_F = torch.zeros((B,), device=x.device, dtype=x.dtype)
+            div_v = torch.zeros((B,), device=x.device, dtype=x.dtype)
 
-        temp_denom = torch.clamp(temperature_t.view(-1), min=1e-6)
-
-        g2 = self._sde_g2_forward(tau, temperature=temperature_t)
-        f_node = self._sde_f_forward(x, tau, batch_mask, temperature=temperature_t)
-        F_dot_f = scatter_add(torch.sum(F_pred * f_node, dim=-1), batch_mask, dim=0)
-        div_f = self._sde_div_f_forward(x, tau, batch_mask, temperature=temperature_t)
-
-        F_norm2 = scatter_add(torch.sum(F_pred * F_pred, dim=-1), batch_mask, dim=0)
-
-        if compute_hjb:
-            hjb_residual = (
-                du_dt
-                - F_dot_f
-                + 0.5 * g2 * F_norm2 / temp_denom
-                - div_f
-                + 0.5 * g2 * div_F / temp_denom
-            )
-            loss_hjb = hjb_residual * hjb_residual
-        else:
-            loss_hjb = torch.zeros((B,), device=x.device, dtype=x.dtype)
-
+        # Constitutive relation: v = f - 0.5 * g^2 * grad(u) / T
         if compute_consistency:
-            # ∇_x u is only needed for the consistency term; skip it when lambda_consistency=0.
-            if du_dx is None:
-                du_dx = torch.autograd.grad(
-                    outputs=u_pred.sum(),
-                    inputs=x,
-                    create_graph=create_graph,
-                    retain_graph=True if create_graph else False,
-                    allow_unused=False,
-                )[0]
-            per_node_cons = torch.mean((F_pred + du_dx) ** 2, dim=-1)
-            loss_consistency = scatter_mean(per_node_cons, batch_mask, dim=0)
+            g2 = self._sde_g2_forward(tau, temperature=temperature_t)  # (B,)
+            # g2 = self._g_t(tau) * self._g_t(tau)
+            f_node = self._sde_f_forward(x, tau, batch_mask, temperature=temperature_t)  # (N,dim)
+            g2_node = g2[batch_mask].unsqueeze(-1)
+            temp_node = torch.clamp(temperature_t[batch_mask], min=1e-6)
+            target_v = f_node - 0.5 * g2_node * du_dx #/ temp_node
+            per_node_rel = torch.sum((V_pred - target_v) ** 2, dim=-1)
+            # Keep per-example shape (B,). Historically, reduce='none' still returned (B,)
+            # for this API, so we treat it as mean aggregation over nodes.
+            if reduce in {"mean", "none"}:
+                loss_relation = scatter_mean(per_node_rel / self.dim, batch_mask, dim=0)
+            else:
+                loss_relation = scatter_add(per_node_rel, batch_mask, dim=0)
         else:
-            loss_consistency = torch.zeros((B,), device=x.device, dtype=x.dtype)
+            loss_relation = torch.zeros((B,), device=x.device, dtype=x.dtype)
+
+        # Continuity residual: du/dt + v·∇u - div(v) = 0
+        if compute_hjb:
+            v_dot_grad_u = scatter_add(torch.sum(V_pred * du_dx, dim=-1), batch_mask, dim=0)
+            continuity_residual = du_dt + v_dot_grad_u - div_v
+            loss_continuity = continuity_residual * continuity_residual
+        else:
+            loss_continuity = torch.zeros((B,), device=x.device, dtype=x.dtype)
             
         if debug:
             mem_str = ""
@@ -1141,24 +1122,21 @@ class CoordScoreDiffusion:
             )
             status_msg = (
                 f"du_dt: {du_dt.mean():.4f} | "
-                f"F_dot_f: {F_dot_f.mean():.4f} | "
-                f"Term3: {torch.mean(0.5 * g2 * F_norm2 / temp_denom):.4f} | "
-                f"div_f: {div_f.mean():.4f} | "
-                f"Term5: {torch.mean(0.5 * g2 * div_F / temp_denom):.4f} |"
+                f"v.gradU: {scatter_add(torch.sum(V_pred * du_dx, dim=-1), batch_mask, dim=0).mean():.4f} | "
+                f"div_v: {div_v.mean():.4f} |"
                 f"{mem_str}"
                 f"{flag_str}"
             )
             print(status_msg, end="\r")
 
         if reduce == "none":
-            return loss_hjb, loss_consistency
+            return loss_continuity, loss_relation
         
         # print("force_pred Stats: ", F_pred.mean().item(), F_pred.std().item())
         # print("force true Stats: ", -du_dx.mean().item(), (-du_dx).std().item())
 
-        # Keep per-example shape (B,) for compatibility; reduce only affects node aggregation above.
-        # return loss_hjb, loss_consistency
-        return self.reduce_loss(loss_hjb, batch_mask, reduce), self.reduce_loss(loss_consistency, batch_mask, reduce)
+        # Both losses are already per-example (B,) at this point.
+        return loss_continuity, loss_relation
 
 
     def reverse_step(

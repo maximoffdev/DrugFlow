@@ -218,14 +218,10 @@ class RadiusMLPDynamics(nn.Module):
         energy_node = self.energy_node_head(ef_feats).squeeze(-1)  # (N,)
         energy = scatter_mean(energy_node, mask_atoms, dim=0)  # (B,)
 
-        # Direct force head.
-        force = self.force_head(ef_feats)  # (N,3)
-
         pred_ligand = {
-            "vel": vel,
+            "v": vel,
             "logits_h": logits_h,
             "energy": energy,
-            "force": force,
         }
         pred_residues = {}
         return pred_ligand, pred_residues

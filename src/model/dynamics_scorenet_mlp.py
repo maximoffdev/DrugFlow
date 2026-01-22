@@ -67,7 +67,7 @@ class TimeAwareResBlock(nn.Module):
 
 
 class ScoreNet(nn.Module):
-    """Time-conditioned MLP predicting force F(x,t) and energy u(x,t)."""
+    """Time-conditioned MLP predicting velocity v(x,t) and energy u(x,t)."""
 
     def __init__(self, input_dim: int = 2, hidden_dim: int = 128, time_emb_dim: int = 64, num_layers: int = 3):
         super().__init__()
@@ -105,10 +105,10 @@ class ScoreNet(nn.Module):
 class ScoreNetMLPDynamics(nn.Module):
     """Drop-in dynamics module for EnergyForceDiffusion using ScoreNet MLP.
 
-    Matches the dynamics forward signature and returns pred_ligand with keys:
-      - logits_h: (N, atom_nf)
-      - energy: (B,)
-      - force: (N, 3)
+        Matches the dynamics forward signature and returns pred_ligand with keys:
+            - logits_h: (N, atom_nf)
+            - energy: (B,)
+            - v: (N, 3)  (velocity)
 
     Notes:
       - For swiss-roll notebook we only use x/y; z is ignored and force_z is zero.
@@ -176,11 +176,11 @@ class ScoreNetMLPDynamics(nn.Module):
         t_node = self._t_to_node(t, mask_atoms, dtype=x2.dtype)
 
         # Forward through ScoreNet
-        force2, energy_node_1 = self.net(x2, t_node)
+        v2, energy_node_1 = self.net(x2, t_node)
 
-        # Pad force to (N,3) for the diffusion module, keep dtype consistent with x_atoms
-        force = torch.zeros((x_atoms.size(0), self.x_dim), device=x_atoms.device, dtype=x_atoms.dtype)
-        force[:, 0:2] = force2.to(dtype=x_atoms.dtype)
+        # Pad velocity to (N,3) for the diffusion module, keep dtype consistent with x_atoms
+        v = torch.zeros((x_atoms.size(0), self.x_dim), device=x_atoms.device, dtype=x_atoms.dtype)
+        v[:, 0:2] = v2.to(dtype=x_atoms.dtype)
 
         # Pool node energies -> per-graph energy (B,)
         energy_node = energy_node_1.squeeze(-1).to(dtype=x_atoms.dtype)
@@ -198,7 +198,7 @@ class ScoreNetMLPDynamics(nn.Module):
         pred_ligand = {
             "logits_h": logits_h,
             "energy": energy,
-            "force": force,
+            "v": v,
         }
         pred_residues = {}
         return pred_ligand, pred_residues

@@ -52,10 +52,10 @@ class RadiusGVPDynamics(nn.Module):
     This mirrors DrugFlow's use of `GVPModel` (via `Dynamics`), but simplified to a
     ligand-only radius graph with no bond types and no pocket nodes.
 
-    Outputs:
-      - logits_h: (N, atom_nf)
-      - energy: (B,)
-      - force: (N, 3)
+        Outputs:
+            - logits_h: (N, atom_nf)
+            - energy: (B,)
+            - v: (N, 3)
     """
 
     def __init__(self, atom_nf: int, x_dim: int = 3, params: RadiusGVPParams = RadiusGVPParams()):
@@ -188,7 +188,7 @@ class RadiusGVPDynamics(nn.Module):
 
         edges = self._build_edges(x_atoms, mask_atoms)
 
-        h_final, force, _ = self.net(h, x_atoms, edges, v=None, batch_mask=mask_atoms, edge_attr=None)
+        h_final, v, _ = self.net(h, x_atoms, edges, v=None, batch_mask=mask_atoms, edge_attr=None)
 
         logits_h = self.atom_decoder(h_final)
 
@@ -199,7 +199,7 @@ class RadiusGVPDynamics(nn.Module):
         pred_ligand = {
             "logits_h": logits_h,
             "energy": energy,
-            "force": force,
+            "v": v,
         }
         pred_residues = {}
         return pred_ligand, pred_residues
