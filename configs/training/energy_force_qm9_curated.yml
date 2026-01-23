@@ -57,18 +57,16 @@ loss_params:
   discrete_loss: CE  # CE or VLB
 
   # Loss weights
-  lambda_x: 1.0
+  lambda_cfm: 1.0
+  cfm_weight_by_snr: True
+  cfm_use_min_snr: True
+  cfm_min_snr_gamma: 5.0
+
   lambda_h: 0.0
   lambda_energy: 0.0
 
-  # New: energy gauge regularizer (encourage u(x,t=0) ≈ 0). Default 0.0 (off).
-  lambda_energy_t0: 0.0
-
   lambda_hjb: 0.0
-  lambda_consistency: 0.0
-  x_score_weight_by_sigma: True
-  use_min_snr: False
-  min_snr_gamma: 5.0
+  lambda_consistency: 1.0
 
 
   # HJB divergence estimator:
@@ -86,7 +84,7 @@ simulation_params:
   center_ligand: True
 
   enforce_zero_com_noise: True
-  project_predicted_force_zero_com: True
+  project_predicted_v_zero_com: True
   diffuse_h: False
 
   # Score diffusion noise schedule for coordinates (t=0 noise -> t=1 clean)
