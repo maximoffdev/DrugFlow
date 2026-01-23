@@ -205,7 +205,7 @@ if __name__ == "__main__":
         accelerator='gpu' if args.train_params.gpus > 0 else 'cpu',
         devices=args.train_params.gpus if args.train_params.gpus > 0 else 'auto',
         strategy=('ddp_find_unused_parameters_true' if args.train_params.gpus > 1 else default_strategy),
-        use_distributed_sampler=False,
+        use_distributed_sampler=True,
         **trainer_kwargs,
     )
 
