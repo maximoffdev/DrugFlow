@@ -510,8 +510,8 @@ class SDEParams:
     """SDE / perturbation-kernel parameters.
 
     time convention:
-      t=0 -> max noise
-      t=1 -> clean
+            t=0 -> clean
+            t=1 -> max noise
     """
     kind: Literal["ve", "vp"] = "ve"
 
@@ -530,21 +530,21 @@ class CoordScoreDiffusion:
 
     This lives alongside the existing flow-matching (ICFM) classes.
 
-        Time convention (match DrugFlow / flow-matching configs):
+        Time convention (diffusion / forward time):
             - t in [0, 1]
-            - t=0 corresponds to maximum noise (prior)
-            - t=1 corresponds to data (clean)
+            - t=0 corresponds to data (clean)
+            - t=1 corresponds to maximum noise (prior)
 
         This implementation uses a VE (variance exploding) style perturbation kernel:
             x_t = x_clean + sigma(t) * eps,  eps ~ N(0, I)
-        with sigma(t) decreasing from sigma_max at t=0 to sigma_min at t=1.
+        with sigma(t) increasing from sigma_min at t=0 to sigma_max at t=1.
 
     Training target score for DSM is:
       s*(x_t, t) = \nabla_{x_t} log p(x_t | x_0) = (x_0 - x_t) / sigma(t)^2
 
         Sampling provides a simple denoising step compatible with VE discretizations:
             x_{t} = x_{s} + (sigma(s)^2 - sigma(t)^2) * score(x_s, s) + sqrt(sigma(s)^2 - sigma(t)^2) * z
-        where 0 <= s < t <= 1 (i.e. we move from noisier to cleaner).
+        where 0 <= t < s <= 1 (i.e. we move from noisier to cleaner by decreasing time).
 
     Temperature:
       The API accepts an optional batch-level `temperature` tensor (B,1) and
@@ -584,11 +584,6 @@ class CoordScoreDiffusion:
         mean_v = scatter_mean(v, batch_mask, dim=0)
         return v - mean_v[batch_mask]
 
-    def _tau(self, t: torch.Tensor) -> torch.Tensor:
-        """Convert 'clean-time' t (0 noise -> 1 clean) to forward-time tau (0 clean -> 1 noisy)."""
-        t = torch.clamp(t, 0.0, 1.0)
-        return 1.0 - t
-
     def alpha(self, t: torch.Tensor, temperature: torch.Tensor | None = None) -> torch.Tensor:
         """Mean coefficient alpha(t) for x_t = alpha(t) x0 + sigma(t) eps."""
         t = torch.clamp(t, 0.0, 1.0)
@@ -597,8 +592,6 @@ class CoordScoreDiffusion:
             return torch.ones_like(t)
 
         if self.sde.kind == "vp":
-            tau = self._tau(t)
-
             # Temperature control for VP that preserves alpha(t)^2 + sigma(t)^2 = 1:
             # scale the beta schedule by temperature (higher T -> faster diffusion).
             # T_ref=1.0 keeps default behavior unchanged.
@@ -615,7 +608,7 @@ class CoordScoreDiffusion:
 
             beta0 = torch.as_tensor(self.sde.beta_min, device=t.device, dtype=t.dtype) * beta_scale
             beta1 = torch.as_tensor(self.sde.beta_max, device=t.device, dtype=t.dtype) * beta_scale
-            int_beta = beta0 * tau + 0.5 * (beta1 - beta0) * tau * tau
+            int_beta = beta0 * t + 0.5 * (beta1 - beta0) * t * t
             return torch.exp(-0.5 * int_beta)
 
         raise ValueError(f"Unknown SDE kind: {self.sde.kind}")
@@ -639,8 +632,8 @@ class CoordScoreDiffusion:
             temp_scale = None
 
         if self.sde.kind == "ve":
-            # t=0 -> sigma_max, t=1 -> sigma_min
-            sigma = float(self.sde.sigma_max) * (float(self.sde.sigma_min) / float(self.sde.sigma_max)) ** t
+            # t=0 -> sigma_min, t=1 -> sigma_max
+            sigma = float(self.sde.sigma_min) * (float(self.sde.sigma_max) / float(self.sde.sigma_min)) ** t
 
             if temp_scale is not None:
                 sigma = sigma * temp_scale
@@ -671,17 +664,16 @@ class CoordScoreDiffusion:
         return xt, eps
 
     def sample_z1(self, com: torch.Tensor, batch_mask: torch.Tensor, temperature=None) -> torch.Tensor:
-        """Prior for sampling: x_{t=0} ~ N(com, sigma_max^2 I).
+        """Prior for sampling: x_{t=1} ~ N(com, sigma_max^2 I).
 
-        Name kept as sample_z1 for historical symmetry with ICFM codepaths; for
-        score diffusion with DrugFlow convention, this returns the t=0 state.
+        Name kept as sample_z1 for historical symmetry with ICFM codepaths.
         """
         z = torch.randn((len(batch_mask), self.dim), device=batch_mask.device, dtype=com.dtype)
         if self.enforce_zero_com_noise:
             z = self._project_zero_com(z, batch_mask)
-        t0 = torch.zeros((com.size(0), 1), device=com.device, dtype=com.dtype)
-        sigma_0 = self.sigma(t0, temperature=temperature)
-        z = z * sigma_0[batch_mask] + com[batch_mask]
+        t1 = torch.ones((com.size(0), 1), device=com.device, dtype=com.dtype)
+        sigma_1 = self.sigma(t1, temperature=temperature)
+        z = z * sigma_1[batch_mask] + com[batch_mask]
         return z
 
     def score_target(self, xt: torch.Tensor, x_clean: torch.Tensor, t: torch.Tensor, batch_mask: torch.Tensor, temperature=None):
@@ -781,39 +773,28 @@ class CoordScoreDiffusion:
 
         return self.reduce_loss(per_node, batch_mask, reduce)
 
-    def _ve_sigma_forward(self, tau: torch.Tensor, temperature: torch.Tensor | None = None) -> torch.Tensor:
-        """Forward-time VE sigma schedule.
-
-        This is expressed in diffusion (forward) time tau where tau=0 is clean and tau=1 is max noise.
-        """
-        tau = torch.clamp(tau, 0.0, 1.0)
-        sigma = float(self.sde.sigma_min) * (float(self.sde.sigma_max) / float(self.sde.sigma_min)) ** tau
-        if isinstance(temperature, torch.Tensor):
-            # Mirror sigma() temperature scaling: sigma <- sigma * sqrt(T)
-            if temperature.numel() == 1:
-                temperature = temperature.expand_as(tau)
-            T_ref = 1.0
-            sigma = sigma * torch.sqrt(torch.clamp(temperature / T_ref, min=1e-6))
-        return sigma
-
-    def _sde_g2_forward(self, tau: torch.Tensor, temperature: torch.Tensor | None = None) -> torch.Tensor:
-        """Return g(tau)^2 for the forward SDE coefficients.
+    def _sde_g2(
+        self,
+        t: torch.Tensor,
+        temperature: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return g(t)^2 for the forward SDE coefficients in diffusion time.
 
         Shapes:
-          tau: (B,1)
+          t: (B,1)
           returns: (B,)
         """
-        tau = torch.clamp(tau, 0.0, 1.0)
+        t = torch.clamp(t, 0.0, 1.0)
 
         if self.sde.kind == "ve":
-            sigma_tau = self._ve_sigma_forward(tau, temperature=temperature).view(-1)
+            sigma_t = self.sigma(t, temperature=temperature).view(-1)
             log_ratio = math.log(float(self.sde.sigma_max) / float(self.sde.sigma_min))
-            return (2.0 * log_ratio) * (sigma_tau * sigma_tau)
+            return (2.0 * log_ratio) * (sigma_t * sigma_t)
 
         if self.sde.kind == "vp":
             beta0 = float(self.sde.beta_min)
             beta1 = float(self.sde.beta_max)
-            beta = (beta0 + (beta1 - beta0) * tau)
+            beta = (beta0 + (beta1 - beta0) * t)
             if isinstance(temperature, torch.Tensor):
                 beta = beta * torch.clamp(temperature, min=1e-6)
             vp_scale = float(self.sde.vp_sigma_scale)
@@ -821,36 +802,28 @@ class CoordScoreDiffusion:
 
         raise ValueError(f"Unknown SDE kind: {self.sde.kind}")
 
-    def _g_t(self, t):
-        # g(t) = sigma(t) * sqrt(2 * (log(sigma_max) - log(sigma_min)))
-        # This ensures the marginal distribution is roughly N(x, sigma(t)^2)
-        # t = 1.0 - t
-        sigma_t = float(self.sde.sigma_min) * (float(self.sde.sigma_max) / float(self.sde.sigma_min)) ** t
-        log_ratio = math.log(float(self.sde.sigma_max)) - math.log(float(self.sde.sigma_min))
-        return (sigma_t * math.sqrt(2.0 * log_ratio)).view(-1)
-
-    def _sde_f_forward(
+    def _sde_f(
         self,
         x: torch.Tensor,
-        tau: torch.Tensor,
+        t: torch.Tensor,
         batch_mask: torch.Tensor,
         temperature: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return drift f(x,tau) for the forward SDE coefficients.
+        """Return drift f(x,t) for the forward SDE coefficients.
 
         Shapes:
           x: (N,dim)
-          tau: (B,1)
+                    t: (B,1)
           returns: (N,dim)
         """
         if self.sde.kind == "ve":
             return torch.zeros_like(x)
 
         if self.sde.kind == "vp":
-            tau = torch.clamp(tau, 0.0, 1.0)
+            t = torch.clamp(t, 0.0, 1.0)
             beta0 = float(self.sde.beta_min)
             beta1 = float(self.sde.beta_max)
-            beta = (beta0 + (beta1 - beta0) * tau)
+            beta = (beta0 + (beta1 - beta0) * t)
             if isinstance(temperature, torch.Tensor):
                 beta = beta * torch.clamp(temperature, min=1e-6)
             beta_node = beta[batch_mask]
@@ -858,14 +831,14 @@ class CoordScoreDiffusion:
 
         raise ValueError(f"Unknown SDE kind: {self.sde.kind}")
 
-    def _sde_div_f_forward(
+    def _sde_div_f(
         self,
         x: torch.Tensor,
-        tau: torch.Tensor,
+        t: torch.Tensor,
         batch_mask: torch.Tensor,
         temperature: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return div(f)(x,tau) aggregated per example (B,)."""
+        """Return div(f)(x,t) aggregated per example (B,)."""
         B = int(batch_mask.max().item()) + 1 if batch_mask.numel() > 0 else 0
         if B == 0:
             return torch.empty((0,), device=x.device, dtype=x.dtype)
@@ -874,10 +847,10 @@ class CoordScoreDiffusion:
             return torch.zeros((B,), device=x.device, dtype=x.dtype)
 
         if self.sde.kind == "vp":
-            tau = torch.clamp(tau, 0.0, 1.0)
+            t = torch.clamp(t, 0.0, 1.0)
             beta0 = float(self.sde.beta_min)
             beta1 = float(self.sde.beta_max)
-            beta = (beta0 + (beta1 - beta0) * tau)
+            beta = (beta0 + (beta1 - beta0) * t)
             if isinstance(temperature, torch.Tensor):
                 beta = beta * torch.clamp(temperature, min=1e-6)
             beta_node = beta[batch_mask]
@@ -917,8 +890,8 @@ class CoordScoreDiffusion:
           - Constitutive relation tying velocity to SDE coefficients and energy gradient:
               v = f(x,tau) - 0.5 * g(tau)^2 * ∇u / T
 
-        Notes:
-          - We evaluate SDE coefficients in forward diffusion time tau = 1 - t (tau=0 clean).
+                Notes:
+                    - SDE coefficients are evaluated in diffusion (forward) time t (t=0 clean).
           - The `compute_hjb` flag controls continuity loss computation.
           - The `compute_consistency` flag controls constitutive-relation loss computation.
           - `trace_batch_size` chunks Hutchinson trace samples to reduce peak memory.
@@ -962,8 +935,6 @@ class CoordScoreDiffusion:
                 temperature_t = temperature_t.unsqueeze(-1)
             if temperature_t.shape != (B, 1):
                 raise ValueError(f"temperature must have shape (B,1) or scalar; got {tuple(temperature_t.shape)}")
-
-        tau = self._tau(t)
 
         # Gradients of u w.r.t. time and space.
         # For the continuity equation we need du/dt, du/dx, and div(v).
@@ -1072,12 +1043,11 @@ class CoordScoreDiffusion:
 
         # Constitutive relation: v = f - 0.5 * g^2 * grad(u) / T
         if compute_consistency:
-            g2 = self._sde_g2_forward(tau, temperature=temperature_t)  # (B,)
-            # g2 = self._g_t(tau) * self._g_t(tau)
-            f_node = self._sde_f_forward(x, tau, batch_mask, temperature=temperature_t)  # (N,dim)
+            g2 = self._sde_g2(t, temperature=temperature_t)  # (B,)
+            f_node = self._sde_f(x, t, batch_mask, temperature=temperature_t)  # (N,dim)
             g2_node = g2[batch_mask].unsqueeze(-1)
             temp_node = torch.clamp(temperature_t[batch_mask], min=1e-6)
-            target_v = f_node - 0.5 * g2_node * du_dx #/ temp_node
+            target_v = f_node + 0.5 * g2_node * du_dx #/ temp_node
             per_node_rel = torch.sum((V_pred - target_v) ** 2, dim=-1)
             # Keep per-example shape (B,). Historically, reduce='none' still returned (B,)
             # for this API, so we treat it as mean aggregation over nodes.
@@ -1149,7 +1119,7 @@ class CoordScoreDiffusion:
         temperature=None,
         stochastic: bool = True,
     ) -> torch.Tensor:
-        """Single denoising step from time s to time t (expects 0 <= s < t <= 1).
+        """Single denoising step from time s to time t (expects 0 <= t < s <= 1).
 
         VE: uses the original discretization.
         VP: uses a reverse-SDE Euler-Maruyama step when stochastic=True; otherwise uses
@@ -1161,11 +1131,9 @@ class CoordScoreDiffusion:
             if not stochastic:
                 return self.ode_step(xs, score_s, s=s, t=t, batch_mask=batch_mask, temperature=temperature)
 
-            # VP reverse SDE in our time convention (t=0 noisy -> t=1 clean).
-            # Internally, VP schedules are defined in forward time tau=1-t, and sampling
-            # from noisy->clean corresponds to tau decreasing.
-            # Euler-Maruyama update for a step tau_s -> tau_t (dtau = t - s):
-            #   x <- x - (f - g^2 * score) * dtau + g * sqrt(dtau) * z
+            # VP reverse SDE stepping backward in diffusion time.
+            # Euler-Maruyama update for a step s -> t with dt = (t - s) < 0:
+            #   x <- x + (f - g^2 * score) * dt + g * sqrt(-dt) * z
             # with forward drift f = -0.5 * beta(tau) * x and g^2 = beta(tau) * vp_sigma_scale^2.
 
             # Ensure temperature is a torch tensor if provided.
@@ -1174,10 +1142,9 @@ class CoordScoreDiffusion:
             if isinstance(temperature, torch.Tensor):
                 temperature = temperature.to(device=s.device, dtype=s.dtype)
 
-            tau_s = self._tau(s)
             beta0 = float(self.sde.beta_min)
             beta1 = float(self.sde.beta_max)
-            beta = beta0 + (beta1 - beta0) * tau_s  # (B,1)
+            beta = beta0 + (beta1 - beta0) * s  # (B,1)
 
             # Match alpha()/sigma() temperature scaling: scale beta by temperature.
             if isinstance(temperature, torch.Tensor):
@@ -1186,20 +1153,19 @@ class CoordScoreDiffusion:
                 beta = beta * torch.clamp(temperature, min=1e-6)
 
             beta_node = beta[batch_mask]  # (N,1)
-            dt = (t - s)[batch_mask]  # (N,1)
-            dt = torch.clamp(dt, min=0.0)
+            dt = (t - s)[batch_mask]  # (N,1) expected negative when denoising
 
             vp_scale = float(self.sde.vp_sigma_scale)
             g2_node = beta_node * (vp_scale * vp_scale)
 
-            # -f*dt = 0.5 * beta * x * dt; and +g^2*score*dt
-            drift = (0.5 * beta_node) * xs + g2_node * score_s
+            f_node = -0.5 * beta_node * xs
+            drift = f_node - g2_node * score_s
 
             noise = torch.randn_like(xs)
             if self.enforce_zero_com_noise:
                 noise = self._project_zero_com(noise, batch_mask)
             g_node = torch.sqrt(torch.clamp(beta_node, min=0.0)) * vp_scale
-            diffusion = g_node * torch.sqrt(torch.clamp(dt, min=0.0)) * noise
+            diffusion = g_node * torch.sqrt(torch.clamp(torch.abs(dt), min=0.0)) * noise
 
             return xs + drift * dt + diffusion
 
@@ -1268,7 +1234,7 @@ class CoordScoreDiffusion:
         """ODE sampler from noise (t_start) to clean (t_end).
 
         Args:
-          x0: initial coordinates at t_start (typically a noisy prior sample)
+          x0: initial coordinates at t_start (typically a noisy prior sample, e.g. t_start=1)
           batch_mask: (N,) mapping nodes -> example
           score_fn: callable(score_fn(x, t_array, batch_mask, temperature) -> score)
             - must return score with shape (N,3)
@@ -1305,9 +1271,9 @@ class CategoricalLogitScoreDiffusion:
 
     where the categorical distribution is obtained with softmax(y).
 
-    Time convention matches DrugFlow:
-      - t=0 : max noise (prior)
-      - t=1 : clean (data)
+        Time convention (diffusion / forward time):
+            - t=0 : clean (data)
+            - t=1 : max noise (prior)
 
     Notes:
       - This is a continuous relaxation of categorical diffusion.
@@ -1332,17 +1298,11 @@ class CategoricalLogitScoreDiffusion:
             sde = SDEParams(kind="ve", sigma_min=float(sigma_min), sigma_max=float(sigma_max))
         self.sde = sde
 
-    def _tau(self, t: torch.Tensor) -> torch.Tensor:
-        t = torch.clamp(t, 0.0, 1.0)
-        return 1.0 - t
-
     def alpha(self, t: torch.Tensor, temperature: torch.Tensor | None = None) -> torch.Tensor:
         t = torch.clamp(t, 0.0, 1.0)
         if self.sde.kind == "ve":
             return torch.ones_like(t)
         if self.sde.kind == "vp":
-            tau = self._tau(t)
-
             if temperature is not None and not isinstance(temperature, torch.Tensor):
                 temperature = torch.as_tensor(temperature, device=t.device, dtype=t.dtype)
             if isinstance(temperature, torch.Tensor):
@@ -1356,7 +1316,7 @@ class CategoricalLogitScoreDiffusion:
 
             beta0 = torch.as_tensor(self.sde.beta_min, device=t.device, dtype=t.dtype) * beta_scale
             beta1 = torch.as_tensor(self.sde.beta_max, device=t.device, dtype=t.dtype) * beta_scale
-            int_beta = beta0 * tau + 0.5 * (beta1 - beta0) * tau * tau
+            int_beta = beta0 * t + 0.5 * (beta1 - beta0) * t * t
             return torch.exp(-0.5 * int_beta)
         raise ValueError(f"Unknown SDE kind: {self.sde.kind}")
 
@@ -1375,7 +1335,7 @@ class CategoricalLogitScoreDiffusion:
             temp_scale = None
 
         if self.sde.kind == "ve":
-            sigma = float(self.sde.sigma_max) * (float(self.sde.sigma_min) / float(self.sde.sigma_max)) ** t
+            sigma = float(self.sde.sigma_min) * (float(self.sde.sigma_max) / float(self.sde.sigma_min)) ** t
             if temp_scale is not None:
                 sigma = sigma * temp_scale
             return sigma
@@ -1404,7 +1364,7 @@ class CategoricalLogitScoreDiffusion:
         return yt, eps
 
     def sample_prior(self, batch_mask: torch.Tensor, temperature=None, dtype: torch.dtype | None = None) -> torch.Tensor:
-        """Prior for sampling at t=0: y_0 ~ N(0, sigma_max^2 I)."""
+        """Prior for sampling at t=1: y_1 ~ N(0, sigma_max^2 I)."""
         if batch_mask.numel() == 0:
             return torch.empty((0, self.n_classes), device=batch_mask.device, dtype=dtype or torch.float32)
 
@@ -1412,9 +1372,9 @@ class CategoricalLogitScoreDiffusion:
         if dtype is None:
             dtype = torch.float32
         n_samples = int(batch_mask.max().item()) + 1
-        sigma_0 = self.sigma(torch.zeros((n_samples, 1), device=device, dtype=dtype), temperature=temperature)
+        sigma_1 = self.sigma(torch.ones((n_samples, 1), device=device, dtype=dtype), temperature=temperature)
         eps = torch.randn((batch_mask.size(0), self.n_classes), device=device, dtype=dtype)
-        return eps * sigma_0[batch_mask]
+        return eps * sigma_1[batch_mask]
 
     def score_target(self, yt: torch.Tensor, y_clean: torch.Tensor, t: torch.Tensor, batch_mask: torch.Tensor, temperature=None):
         a_t = self.alpha(t, temperature=temperature)[batch_mask]

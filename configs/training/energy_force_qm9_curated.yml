@@ -21,7 +21,7 @@ train_params:
   batch_size: 64
   accumulate_grad_batches: 2
   lr: 5.0e-4
-  n_epochs: 1
+  n_epochs: 1000
   num_workers: 0
   gpus: 1
   clip_grad: True

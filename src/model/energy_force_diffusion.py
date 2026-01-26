@@ -119,8 +119,8 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.n_steps = simulation_params.n_steps
         self.train_step_size = 1.0 / float(self.n_steps)
 
-        # Timestep sampling range (t=0 noisy -> t=1 clean). Useful to avoid very-clean
-        # regimes early in training.
+        # Timestep sampling range in diffusion time (t=0 clean -> t=1 noisy).
+        # Useful to avoid very-noisy regimes early in training.
         set_default(simulation_params, "t_min", 0.0)
         set_default(simulation_params, "t_max", 1.0)
         self.t_min = float(simulation_params.t_min)
@@ -170,7 +170,7 @@ class EnergyForceDiffusion(pl.LightningModule):
             raise ValueError(f"simulation_params.x_dim must be >= 2; got {self.x_dim}")
 
         # Modules
-        # Score-based diffusion on coordinates (t=0 noise, t=1 clean)
+        # Score-based diffusion on coordinates (diffusion time: t=0 clean, t=1 noisy)
         set_default(simulation_params, "sigma_min", 0.01)
         set_default(simulation_params, "sigma_max", 50.0)
         set_default(simulation_params, "coord_sde_kind", "ve")
@@ -599,13 +599,16 @@ class EnergyForceDiffusion(pl.LightningModule):
 
         if need_noisy_pass:
             # Noise
-            # Coordinates: perturb the clean sample x (t=1 clean) with sigma(t) (t=0 most noisy)
+            # Coordinates: perturb the clean sample x (t=0 clean) with sigma(t) (t=1 most noisy)
             zt_x, eps_x = self.module_x.sample_zt(ligand["x"], t, ligand["mask"], temperature=temperature)
 
             # Atom types: optionally diffuse, otherwise condition on clean one_hot.
             if self.diffuse_h and (self.lambda_h is None or float(self.lambda_h) != 0.0):
                 z0_h = self.module_h.sample_z0(ligand["mask"])
-                zt_h = self.module_h.sample_zt(z0_h, ligand["one_hot"], t, ligand["mask"])
+                # Markov-bridge time convention is t_mb=0 noisy -> t_mb=1 clean.
+                # Convert diffusion-time t (0 clean -> 1 noisy) to bridge-time t_mb.
+                t_mb = 1.0 - t
+                zt_h = self.module_h.sample_zt(z0_h, ligand["one_hot"], t_mb, ligand["mask"])
             else:
                 zt_h = ligand["one_hot"]
         else:
@@ -661,13 +664,15 @@ class EnergyForceDiffusion(pl.LightningModule):
         if need_h and self.diffuse_h and (self.lambda_h is None or float(self.lambda_h) != 0.0):
             assert pred_ligand is not None
             assert zt_h is not None
-            t_next = torch.clamp(t + self.train_step_size, max=1.0)
+            # Markov-bridge time convention is t_mb=0 noisy -> t_mb=1 clean.
+            t_mb = 1.0 - t
+            t_next = torch.clamp(t_mb + self.train_step_size, max=1.0)
             loss_h = self.module_h.compute_loss(
                 pred_ligand["logits_h"],
                 zt_h,
                 ligand["one_hot"],
                 ligand["mask"],
-                t,
+                t_mb,
                 t_next,
                 reduce=self.loss_reduce,
             )
@@ -675,8 +680,9 @@ class EnergyForceDiffusion(pl.LightningModule):
             loss_h = torch.zeros_like(loss_x)
 
         # Supervised energy head (computed on clean x/h).
-        # Use t=1.0 for the energy head to represent the clean configuration.
+        # Use t=0.0 to represent the clean configuration.
         loss_energy = torch.zeros_like(loss_x)
+        loss_energy_t0 = torch.zeros_like(loss_x)
         loss_cfm = torch.zeros_like(loss_x)
         loss_hjb = torch.zeros_like(loss_x)
         loss_consistency = torch.zeros_like(loss_x)
@@ -723,7 +729,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         ######## Compute energy match loss (boundary condition 1) ########
 
         if (energy is not None) and (float(self.lambda_energy) > 0.0):
-            t_clean = torch.ones_like(t)
+            t_clean = torch.zeros_like(t)
             pred_clean, _ = self.dynamics(
                 ligand["x"],
                 ligand["one_hot"],
@@ -751,17 +757,16 @@ class EnergyForceDiffusion(pl.LightningModule):
                 raise ValueError("lambda_cfm is only implemented for coord_sde_kind='ve' (VE kinematics)")
             assert pred_ligand is not None
             assert eps_x is not None
-            # Build target velocity using forward diffusion time tau = 1 - t (tau: clean->noise).
-            # The model predicts velocity in model-time t (noise->clean), so v_target(t) = -d/dtau x(tau).
-            tau = (1.0 - t).detach()  # (B,1); detach to avoid building higher-order graphs unnecessarily
-            # sigma(tau) = sigma_min * (sigma_max/sigma_min)^tau
+            # Build target velocity in diffusion time t (0 clean -> 1 noisy).
+            # For VE: x(t) = x0 + sigma(t) * eps  =>  v_target = dx/dt = d_sigma/dt * eps.
+            t_det = t.detach()  # avoid building higher-order graphs unnecessarily
             sigma_min = float(self.module_x.sde.sigma_min)
             sigma_max = float(self.module_x.sde.sigma_max)
             log_ratio = float(np.log(sigma_max / sigma_min))
-            sigma_tau = sigma_min * (sigma_max / sigma_min) ** tau
-            d_sigma_dtau = sigma_tau * log_ratio
+            sigma_t = self.module_x.sigma(t_det, temperature=temperature)  # (B,1)
+            d_sigma_dt = sigma_t * log_ratio
 
-            v_target = -(d_sigma_dtau[ligand["mask"]] * eps_x)
+            v_target = d_sigma_dt[ligand["mask"]] * eps_x
             per_node = torch.sum((pred_ligand["v"].to(dtype=ligand["x"].dtype) - v_target) ** 2, dim=-1)
 
             # Optional SNR weighting (VE: SNR = 1/sigma(t)^2) to emphasize noisier steps
@@ -1006,7 +1011,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         Args:
           n_samples: number of molecules
           num_nodes: int (fixed size) or tensor (n_samples,) with per-mol sizes
-          timesteps: Euler steps from t=0 -> t=1
+          timesteps: Euler steps from t=1 -> t=0 (denoising)
           temperature: scalar conditioning value (if None, uses config temperature)
           x_sampler: 'ode' or 'sde'
           h_sampler: 'markov_bridge' or 'score'
@@ -1035,7 +1040,7 @@ class EnergyForceDiffusion(pl.LightningModule):
                 temperature = float(self.temperature)
             t_temperature = torch.full((n_samples, 1), float(temperature), device=device, dtype=dtype)
 
-        # Initialize x at t=0 (noisy prior). Use COM=0 for each molecule.
+        # Initialize x at t=1 (noisy prior). Use COM=0 for each molecule.
         com = torch.zeros((n_samples, self.x_dim), device=device, dtype=dtype)
         x = self.module_x.sample_z1(com, batch_mask, temperature=t_temperature)
 
@@ -1060,8 +1065,9 @@ class EnergyForceDiffusion(pl.LightningModule):
 
         dt = 1.0 / float(timesteps)
         for i in range(timesteps):
-            s_val = i * dt
-            t_val = (i + 1) * dt
+            # Denoising integration: start at s=1 and step down to t=0.
+            s_val = 1.0 - i * dt
+            t_val = 1.0 - (i + 1) * dt
             s = torch.full((n_samples, 1), s_val, device=device, dtype=dtype)
             t = torch.full((n_samples, 1), t_val, device=device, dtype=dtype)
 
@@ -1077,7 +1083,7 @@ class EnergyForceDiffusion(pl.LightningModule):
             )
 
             # Coordinates (flow matching): explicit Euler integration dx/dt = v(x,t).
-            # We intentionally ignore x_sampler/stochastic_x here: sampling is deterministic.
+            # We integrate backward in diffusion time (step is negative).
             step = (t - s)[batch_mask]
             x = x + step * pred_ligand["v"].to(dtype=x.dtype)
 
@@ -1091,11 +1097,14 @@ class EnergyForceDiffusion(pl.LightningModule):
             # Atom types.
             if self.diffuse_h:
                 if h_sampler == "markov_bridge":
+                    # Convert diffusion time to Markov-bridge time (0 noisy -> 1 clean).
+                    s_mb = 1.0 - s
+                    t_mb = 1.0 - t
                     h = self.module_h.sample_zt_given_zs(
                         h,
                         pred_ligand["logits_h"],
-                        s=s,
-                        t=t,
+                        s=s_mb,
+                        t=t_mb,
                         batch_mask=batch_mask,
                     )
                 else:
