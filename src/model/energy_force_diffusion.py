@@ -677,7 +677,6 @@ class EnergyForceDiffusion(pl.LightningModule):
         # Supervised energy head (computed on clean x/h).
         # Use t=1.0 for the energy head to represent the clean configuration.
         loss_energy = torch.zeros_like(loss_x)
-        loss_energy_t0 = torch.zeros_like(loss_x)
         loss_cfm = torch.zeros_like(loss_x)
         loss_hjb = torch.zeros_like(loss_x)
         loss_consistency = torch.zeros_like(loss_x)

@@ -1,4 +1,4 @@
-run_name: energy_force_qm9_curated
+run_name: energy_force_qm9_curated_1_epoch
 model_type: energy_force_diffusion
 
 # Required by src/train.py even if unused by EnergyForceDiffusion
@@ -21,7 +21,7 @@ train_params:
   batch_size: 64
   accumulate_grad_batches: 2
   lr: 5.0e-4
-  n_epochs: 1000
+  n_epochs: 1
   num_workers: 0
   gpus: 1
   clip_grad: True
