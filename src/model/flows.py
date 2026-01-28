@@ -1041,7 +1041,7 @@ class CoordScoreDiffusion:
         else:
             div_v = torch.zeros((B,), device=x.device, dtype=x.dtype)
 
-        # Constitutive relation: v = f - 0.5 * g^2 * grad(u) / T
+        # Constitutive relation: v = f + 0.5 * g^2 * grad(u) / T
         if compute_consistency:
             g2 = self._sde_g2(t, temperature=temperature_t)  # (B,)
             f_node = self._sde_f(x, t, batch_mask, temperature=temperature_t)  # (N,dim)

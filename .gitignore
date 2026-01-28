@@ -2,7 +2,10 @@ __pycache__
 .idea
 *.out
 runs/
-notebooks/
+notebooks/**
+!notebooks/
+!notebooks/**/*.ipynb
 *DS_Store
 samples/
 crossdocked/
+examples/
