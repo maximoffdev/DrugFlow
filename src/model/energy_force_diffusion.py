@@ -88,6 +88,8 @@ class EnergyForceDiffusion(pl.LightningModule):
         set_default(loss_params, "lambda_x", 1.0)
         set_default(loss_params, "lambda_h", 1.0)
         set_default(loss_params, "lambda_energy", 1.0)
+        # Boundary condition at t=0: match predicted force (-∇E) to true forces.
+        set_default(loss_params, "lambda_force_t0", 0.0)
         # Optional conditional flow-matching (CFM) velocity loss (VE kinematics).
         set_default(loss_params, "lambda_cfm", 0.0)
         # Optional HJB PDE loss + force/energy consistency (at noisy time)
@@ -111,6 +113,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.lambda_x = loss_params.lambda_x
         self.lambda_h = loss_params.lambda_h
         self.lambda_energy = loss_params.lambda_energy
+        self.lambda_force_t0 = float(getattr(loss_params, "lambda_force_t0", 0.0))
         self.lambda_cfm = loss_params.lambda_cfm
         self.lambda_hjb = loss_params.lambda_hjb
         self.lambda_consistency = loss_params.lambda_consistency
@@ -123,10 +126,31 @@ class EnergyForceDiffusion(pl.LightningModule):
         # Useful to avoid very-noisy regimes early in training.
         set_default(simulation_params, "t_min", 0.0)
         set_default(simulation_params, "t_max", 1.0)
+
+        # Optional timestep curriculum: ramp up the max sampled diffusion time over epochs.
+        # Mirrors notebooks/test.ipynb (Cell 15 + Cell 21): warmup -> sinusoidal growth -> plateau.
+        set_default(simulation_params, "time_horizon_schedule", "constant")  # 'constant' | 'sinusoidal'
+        set_default(simulation_params, "time_horizon_warmup_fraction", 0.1)
+        set_default(simulation_params, "time_horizon_plateau_start_fraction", 0.8)
+        set_default(simulation_params, "time_horizon_t_min", 0.01)
+        set_default(simulation_params, "time_horizon_t_final", 1.0)
         self.t_min = float(simulation_params.t_min)
         self.t_max = float(simulation_params.t_max)
         if not (0.0 <= self.t_min <= self.t_max <= 1.0):
             raise ValueError(f"simulation_params.t_min/t_max must satisfy 0<=t_min<=t_max<=1; got {self.t_min}, {self.t_max}")
+
+        self.time_horizon_schedule = str(getattr(simulation_params, "time_horizon_schedule", "constant"))
+        self.time_horizon_warmup_fraction = float(getattr(simulation_params, "time_horizon_warmup_fraction", 0.1))
+        self.time_horizon_plateau_start_fraction = float(getattr(simulation_params, "time_horizon_plateau_start_fraction", 0.8))
+        self.time_horizon_t_min = float(getattr(simulation_params, "time_horizon_t_min", 0.01))
+        self.time_horizon_t_final = float(getattr(simulation_params, "time_horizon_t_final", 1.0))
+        if self.time_horizon_schedule not in {"constant", "sinusoidal"}:
+            raise ValueError("simulation_params.time_horizon_schedule must be one of: constant, sinusoidal")
+        if not (0.0 <= self.time_horizon_t_min <= self.time_horizon_t_final <= 1.0):
+            raise ValueError(
+                "simulation_params.time_horizon_t_min/t_final must satisfy 0<=t_min<=t_final<=1; "
+                f"got {self.time_horizon_t_min}, {self.time_horizon_t_final}"
+            )
 
         # Optional training diagnostics
         set_default(train_params, "log_diffusion_stats", False)
@@ -352,6 +376,34 @@ class EnergyForceDiffusion(pl.LightningModule):
             ]
         return optimizers, lr_schedulers
 
+    def _time_horizon_t_max_for_step(self, step: int, total_steps: int) -> float:
+        """Sinusoidal curriculum for the maximum sampled diffusion time.
+
+        Matches the notebook schedule but interprets warmup/plateau fractions over
+        *batch steps* (total_steps = n_epochs * n_batches_per_epoch).
+        """
+        if total_steps <= 0:
+            return float(self.time_horizon_t_final)
+
+        warmup_steps = int(total_steps * float(self.time_horizon_warmup_fraction))
+        plateau_steps = int(total_steps * float(self.time_horizon_plateau_start_fraction))
+        if plateau_steps <= warmup_steps:
+            plateau_steps = warmup_steps + 1
+
+        t_min = float(self.time_horizon_t_min)
+        t_final = float(self.time_horizon_t_final)
+
+        if step < warmup_steps:
+            return t_min
+        if step >= plateau_steps:
+            return t_final
+
+        current_step = step - warmup_steps
+        total_growth_steps = plateau_steps - warmup_steps
+        progress = float(current_step) / float(total_growth_steps)
+        sine_factor = 0.5 * (1.0 - float(np.cos(progress * float(np.pi))))
+        return t_min + (t_final - t_min) * sine_factor
+
     def _make_dataset(self, stage: str) -> PKLEnergyForceDataset:
         datadir = Path(self.datadir)
         stage_dir = datadir / stage
@@ -547,11 +599,13 @@ class EnergyForceDiffusion(pl.LightningModule):
 
         # Timestep t for each example in batch
         if t is None:
-            if self.t_min == 0.0 and self.t_max == 1.0:
-                t = torch.rand(ligand["size"].size(0), device=ligand["x"].device).unsqueeze(-1)
-            else:
-                u = torch.rand(ligand["size"].size(0), device=ligand["x"].device).unsqueeze(-1)
-                t = u * (self.t_max - self.t_min) + self.t_min
+            t_low = float(self.t_min)
+            t_high = float(self.t_max)
+
+            if t_high < t_low:
+                t_high = t_low
+            u = torch.rand(ligand["size"].size(0), device=ligand["x"].device).unsqueeze(-1)
+            t = u * (t_high - t_low) + t_low
         else:
             if t.ndim == 1:
                 t = t.unsqueeze(-1)
@@ -683,6 +737,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         # Use t=0.0 to represent the clean configuration.
         loss_energy = torch.zeros_like(loss_x)
         loss_energy_t0 = torch.zeros_like(loss_x)
+        loss_force_t0 = torch.zeros_like(loss_x)
         loss_cfm = torch.zeros_like(loss_x)
         loss_hjb = torch.zeros_like(loss_x)
         loss_consistency = torch.zeros_like(loss_x)
@@ -726,26 +781,68 @@ class EnergyForceDiffusion(pl.LightningModule):
                     debug=hjb_debug,
                 )
 
-        ######## Compute energy match loss (boundary condition 1) ########
+        ######## Boundary conditions at t=0 (clean) ########
 
-        if (energy is not None) and (float(self.lambda_energy) > 0.0):
+        need_energy_t0 = (energy is not None) and (float(self.lambda_energy) > 0.0)
+        need_force_t0 = (force is not None) and (float(getattr(self, "lambda_force_t0", 0.0)) > 0.0)
+
+        if need_energy_t0 or need_force_t0:
             t_clean = torch.zeros_like(t)
-            pred_clean, _ = self.dynamics(
-                ligand["x"],
-                ligand["one_hot"],
-                ligand["mask"],
-                pocket=None,
-                t=t_clean,
-                temperature=temperature,
-                bonds_ligand=None,
-                sc_transform=None,
-            )
 
-            energy_tgt = energy.to(device=ligand["x"].device, dtype=ligand["x"].dtype).view(-1)
-            energy_pred = pred_clean["energy"].to(dtype=ligand["x"].dtype).view(-1)
-            if energy_pred.shape != energy_tgt.shape:
-                raise ValueError(f"energy_pred must have shape (B,), got {tuple(energy_pred.shape)} vs target {tuple(energy_tgt.shape)}")
-            loss_energy = (energy_pred - energy_tgt) ** 2
+            # Force boundary needs gradients w.r.t. x; Lightning eval loops run under no_grad.
+            if need_force_t0 and (not torch.is_grad_enabled()):
+                force_grad_ctx = torch.enable_grad()
+            else:
+                force_grad_ctx = nullcontext()
+
+            with force_grad_ctx:
+                if need_force_t0:
+                    x_clean = ligand["x"].detach().requires_grad_(True)
+                else:
+                    x_clean = ligand["x"]
+
+                pred_clean, _ = self.dynamics(
+                    x_clean,
+                    ligand["one_hot"],
+                    ligand["mask"],
+                    pocket=None,
+                    t=t_clean,
+                    temperature=temperature,
+                    bonds_ligand=None,
+                    sc_transform=None,
+                )
+
+                if need_force_t0:
+                    assert force is not None
+                    energy_pred_clean = pred_clean["energy"].to(dtype=ligand["x"].dtype).view(-1)
+                    du_dx = torch.autograd.grad(
+                        outputs=energy_pred_clean.sum(),
+                        inputs=x_clean,
+                        create_graph=bool(self.training),
+                        # If we also compute an energy boundary loss using the same forward
+                        # pass, we must retain the graph so the final loss.backward() can
+                        # traverse it again.
+                        retain_graph=bool(need_energy_t0),
+                        allow_unused=False,
+                    )[0]
+                    force_pred = -du_dx
+                    force_tgt = force.to(device=ligand["x"].device, dtype=ligand["x"].dtype)
+                    if force_tgt.shape != force_pred.shape:
+                        raise ValueError(
+                            f"force must have shape {tuple(force_pred.shape)} to match -dE/dx, got {tuple(force_tgt.shape)}"
+                        )
+                    per_node = torch.sum((force_pred - force_tgt) ** 2, dim=-1)
+                    loss_force_t0 = scatter_mean(per_node / float(self.x_dim), ligand["mask"], dim=0)
+
+            if need_energy_t0:
+                assert energy is not None
+                energy_tgt = energy.to(device=ligand["x"].device, dtype=ligand["x"].dtype).view(-1)
+                energy_pred = pred_clean["energy"].to(dtype=ligand["x"].dtype).view(-1)
+                if energy_pred.shape != energy_tgt.shape:
+                    raise ValueError(
+                        f"energy_pred must have shape (B,), got {tuple(energy_pred.shape)} vs target {tuple(energy_tgt.shape)}"
+                    )
+                loss_energy = (energy_pred - energy_tgt) ** 2
 
             # print("True energy:", energy_tgt[:5].detach().cpu().numpy())
             # print("Pred energy:", energy_pred[:5].detach().cpu().numpy())
@@ -784,6 +881,7 @@ class EnergyForceDiffusion(pl.LightningModule):
             self.lambda_x * loss_x
             + self.lambda_h * loss_h
             + self.lambda_energy * loss_energy
+            + float(getattr(self, "lambda_force_t0", 0.0)) * loss_force_t0
             + self.lambda_cfm * loss_cfm
             + self.lambda_hjb * loss_hjb
             + self.lambda_consistency * loss_consistency
@@ -794,6 +892,7 @@ class EnergyForceDiffusion(pl.LightningModule):
             "loss_x": float(loss_x.mean().detach().cpu()),
             "loss_h": float(loss_h.mean().detach().cpu()),
             "loss_energy": float(loss_energy.mean().detach().cpu()),
+            "loss_force_t0": float(loss_force_t0.mean().detach().cpu()),
             "loss_cfm": float(loss_cfm.mean().detach().cpu()),
             "loss_hjb": float(loss_hjb.mean().detach().cpu()),
             "loss_consistency": float(loss_consistency.mean().detach().cpu()),
@@ -819,17 +918,46 @@ class EnergyForceDiffusion(pl.LightningModule):
                 )
         return (loss, info) if return_info else loss
 
-    def training_step(self, batch, *args):
+    def training_step(self, batch, batch_idx: int = 0, *args):
+        # Implement optional time-horizon curriculum over *batch steps*.
+        # If enabled, we pass the sampled t explicitly into compute_loss.
+        t = None
+        t_low = float(self.t_min)
+        t_high = float(self.t_max)
+        if self.time_horizon_schedule == "sinusoidal":
+            try:
+                n_batches = int(getattr(self.trainer, "num_training_batches", 0) or 0)
+                n_epochs = int(getattr(self.trainer, "max_epochs", 0) or getattr(self._train_params, "n_epochs", 0) or 0)
+            except Exception:
+                n_batches = 0
+                n_epochs = int(getattr(self._train_params, "n_epochs", 0) or 0)
+
+            if n_batches > 0 and n_epochs > 0:
+                total_steps = int(n_epochs * n_batches)
+                step = int(self.current_epoch) * int(n_batches) + int(batch_idx)
+                t_high = min(float(self.t_max), float(self._time_horizon_t_max_for_step(step, total_steps)))
+                if t_high < t_low:
+                    t_high = t_low
+                B = int(batch["ligand"]["size"].numel())
+                u = torch.rand((B, 1), device=batch["ligand"]["x"].device, dtype=batch["ligand"]["x"].dtype)
+                t = u * (t_high - t_low) + t_low
+
         loss, info = self.compute_loss(
             batch["ligand"],
             energy=batch.get("energy", None),
             force=batch.get("force", None),
+            t=t,
             return_info=True,
         )
+        # Log the timestep sampling bounds used for this batch.
+        # (For sinusoidal schedule, these reflect the curriculum; otherwise they are the static config bounds.)
+        self.log("t_low/train", float(t_low), on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("t_high/train", float(t_high), on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss/train", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_x/train", info["loss_x"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_h/train", info["loss_h"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_energy/train", info["loss_energy"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("loss_force_t0/train", info["loss_force_t0"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_cfm/train", info["loss_cfm"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_hjb/train", info["loss_hjb"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log(
@@ -865,6 +993,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.log("loss_x/val", info["loss_x"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_h/val", info["loss_h"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_energy/val", info["loss_energy"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("loss_force_t0/val", info["loss_force_t0"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_cfm/val", info["loss_cfm"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_hjb/val", info["loss_hjb"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log(
@@ -900,6 +1029,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.log("loss_x/test", info["loss_x"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_h/test", info["loss_h"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_energy/test", info["loss_energy"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("loss_force_t0/test", info["loss_force_t0"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_cfm/test", info["loss_cfm"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_hjb/test", info["loss_hjb"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log(
