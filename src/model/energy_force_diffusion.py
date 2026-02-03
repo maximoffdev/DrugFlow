@@ -114,6 +114,10 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.lambda_h = loss_params.lambda_h
         self.lambda_energy = loss_params.lambda_energy
         self.lambda_force_t0 = float(getattr(loss_params, "lambda_force_t0", 0.0))
+        # Fraction of graphs in each batch forced to t=0 (used for boundary energy/force losses).
+        # The remaining graphs keep their sampled diffusion times.
+        set_default(loss_params, "t0_batch_fraction", 1.0)
+        self.t0_batch_fraction = float(getattr(loss_params, "t0_batch_fraction", 1.0))
         self.lambda_cfm = loss_params.lambda_cfm
         self.lambda_hjb = loss_params.lambda_hjb
         self.lambda_consistency = loss_params.lambda_consistency
@@ -590,6 +594,8 @@ class EnergyForceDiffusion(pl.LightningModule):
         force: torch.Tensor | None = None,
         t: torch.Tensor | None = None,
         temperature: torch.Tensor | float | None = None,
+        step: int | None = None,
+        total_steps: int | None = None,
     ):
         # Center per-molecule for stability / translation invariance (molecular setting).
         # For 1-node toy graphs this would collapse all inputs to zero, so we make it optional.
@@ -649,19 +655,85 @@ class EnergyForceDiffusion(pl.LightningModule):
         need_cfm = float(getattr(self, "lambda_cfm", 0.0)) > 0.0
         need_hjb = float(self.lambda_hjb) > 0.0
         need_consistency = float(self.lambda_consistency) > 0.0
-        need_noisy_pass = need_x or need_h or need_cfm or need_hjb or need_consistency
 
-        if need_noisy_pass:
-            # Noise
+        # Boundary conditions at t=0 (clean)
+        need_energy_t0 = (energy is not None) and (float(self.lambda_energy) > 0.0)
+        need_force_t0 = (force is not None) and (float(getattr(self, "lambda_force_t0", 0.0)) > 0.0)
+
+        # We run a single forward pass for all enabled losses. For boundary losses we force a
+        # fixed fraction of the *graphs* to have t=0 and keep x clean for those graphs.
+        need_main_pass = need_x or need_h or need_cfm or need_hjb or need_consistency or need_energy_t0 or need_force_t0
+
+        # Apply a fixed fraction of graphs at t=0 (for boundary losses), keep the rest at their sampled t.
+        # This reduces cost by computing du/dx once and reusing it for both boundary force loss and HJB.
+        if need_main_pass:
+            B = int(ligand["size"].size(0))
+            if B <= 0:
+                raise ValueError("Empty batch: ligand['size'] has zero length")
+
+            t_used = t
+            is_t0_graph = torch.zeros((B,), device=ligand["x"].device, dtype=torch.bool)
+            if need_energy_t0 or need_force_t0:
+                # t=0-graph fraction schedule:
+                #  - Start at 100% early in training.
+                #  - Linearly decay to `t0_batch_fraction` until `time_horizon_warmup_fraction` of training.
+                #  - Plateau at `t0_batch_fraction` afterwards.
+                frac_target = float(getattr(self, "t0_batch_fraction", 1.0))
+                frac_target = float(np.clip(frac_target, 0.0, 1.0))
+                frac_used = frac_target
+
+                if self.training and frac_target < 1.0:
+                    warmup_frac = float(getattr(self, "time_horizon_warmup_fraction", 0.0))
+                    warmup_frac = float(np.clip(warmup_frac, 0.0, 1.0))
+
+                    if warmup_frac > 0.0:
+                        step_i: int | None = int(step) if step is not None else None
+                        total_i: int | None = int(total_steps) if total_steps is not None else None
+
+                        # Best-effort fallback when caller doesn't provide step/total_steps.
+                        if (step_i is None) or (total_i is None) or (total_i <= 0):
+                            step_i = int(getattr(self, "global_step", 0) or 0)
+                            trainer = getattr(self, "trainer", None)
+                            total_i = int(getattr(trainer, "estimated_stepping_batches", 0) or 0) if trainer is not None else 0
+
+                        if (total_i is not None) and (total_i > 0) and (step_i is not None):
+                            progress = float(step_i) / float(total_i)
+                            progress = float(np.clip(progress, 0.0, 1.0))
+                            if progress < warmup_frac:
+                                ramp = progress / warmup_frac
+                                frac_used = 1.0 - (1.0 - frac_target) * float(ramp)
+                            else:
+                                frac_used = frac_target
+
+                frac_used = float(np.clip(frac_used, 0.0, 1.0))
+                n_t0 = int(round(frac_used * B))
+                if n_t0 > 0:
+                    # Random subset each step during training; deterministic (first n) during eval.
+                    if self.training:
+                        idx = torch.randperm(B, device=ligand["x"].device)[:n_t0]
+                    else:
+                        idx = torch.arange(n_t0, device=ligand["x"].device)
+                    is_t0_graph[idx] = True
+                    t_used = t.clone()
+                    t_used[is_t0_graph] = 0.0
+
             # Coordinates: perturb the clean sample x (t=0 clean) with sigma(t) (t=1 most noisy)
-            zt_x, eps_x = self.module_x.sample_zt(ligand["x"], t, ligand["mask"], temperature=temperature)
+            # Then override the t=0 subset to use the exact clean coordinates.
+            zt_x, eps_x = self.module_x.sample_zt(ligand["x"], t_used, ligand["mask"], temperature=temperature)
+            if (need_energy_t0 or need_force_t0) and bool(is_t0_graph.any()):
+                is_t0_node = is_t0_graph[ligand["mask"]]
+                zt_x = zt_x.clone()
+                zt_x[is_t0_node] = ligand["x"][is_t0_node]
+                if eps_x is not None:
+                    eps_x = eps_x.clone()
+                    eps_x[is_t0_node] = 0.0
 
             # Atom types: optionally diffuse, otherwise condition on clean one_hot.
             if self.diffuse_h and (self.lambda_h is None or float(self.lambda_h) != 0.0):
                 z0_h = self.module_h.sample_z0(ligand["mask"])
                 # Markov-bridge time convention is t_mb=0 noisy -> t_mb=1 clean.
                 # Convert diffusion-time t (0 clean -> 1 noisy) to bridge-time t_mb.
-                t_mb = 1.0 - t
+                t_mb = 1.0 - t_used
                 zt_h = self.module_h.sample_zt(z0_h, ligand["one_hot"], t_mb, ligand["mask"])
             else:
                 zt_h = ligand["one_hot"]
@@ -669,10 +741,13 @@ class EnergyForceDiffusion(pl.LightningModule):
             zt_x = None
             zt_h = None
             eps_x = None
+            t_used = t
+            is_t0_graph = None
 
-        # Flow-matching PDE losses require gradients w.r.t. (t, x). Lightning runs validation/test
-        # under torch.no_grad(), so we selectively re-enable grad when needed.
-        need_time_space_grads = need_hjb or need_x or need_consistency
+        # Flow-matching PDE losses require gradients w.r.t. (t, x). Boundary force loss also
+        # requires du/dx. Lightning runs validation/test under torch.no_grad(), so we selectively
+        # re-enable grad when needed.
+        need_time_space_grads = need_hjb or need_x or need_consistency or need_force_t0
 
         # Only train with higher-order autodiff; during eval we can compute the residuals
         # with create_graph=False to avoid massive memory usage.
@@ -685,19 +760,19 @@ class EnergyForceDiffusion(pl.LightningModule):
         if need_time_space_grads and (not torch.is_grad_enabled()):
             grad_ctx = torch.enable_grad()
 
-        if need_noisy_pass:
+        if need_main_pass:
             assert zt_x is not None
             assert zt_h is not None
             with grad_ctx:
                 zt_x = zt_x.detach().requires_grad_(need_time_space_grads)
-                t = t.detach().requires_grad_(need_time_space_grads)
+                t_used = t_used.detach().requires_grad_(need_time_space_grads)
 
                 pred_ligand, _ = self.dynamics(
                     zt_x,
                     zt_h,
                     ligand["mask"],
                     pocket=None,
-                    t=t,
+                    t=t_used,
                     temperature=temperature,
                     bonds_ligand=None,
                     sc_transform=None,
@@ -733,8 +808,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         else:
             loss_h = torch.zeros_like(loss_x)
 
-        # Supervised energy head (computed on clean x/h).
-        # Use t=0.0 to represent the clean configuration.
+        # Supervised energy head / boundary condition losses.
         loss_energy = torch.zeros_like(loss_x)
         loss_energy_t0 = torch.zeros_like(loss_x)
         loss_force_t0 = torch.zeros_like(loss_x)
@@ -752,6 +826,24 @@ class EnergyForceDiffusion(pl.LightningModule):
         # if compute_ef:
 
         ######## Flow-matching PDE losses at the *noisy* state (zt_x, t). ########
+        # Compute du/dx once (reused for HJB/consistency and for the t=0 force boundary loss).
+        du_dx_shared = None
+        need_shared_du_dx = need_force_t0 or need_hjb or need_consistency
+        if need_shared_du_dx:
+            if pred_ligand is None or zt_x is None:
+                raise RuntimeError("Internal error: need du/dx but pred_ligand/zt_x is missing")
+            with grad_ctx:
+                u_pred = pred_ligand["energy"].to(dtype=ligand["x"].dtype).view(-1)
+                # Need create_graph for training through force boundary or HJB higher-order.
+                create_graph = bool((enable_higher_order and (need_hjb or need_consistency)) or (need_force_t0 and self.training))
+                du_dx_shared = torch.autograd.grad(
+                    outputs=u_pred.sum(),
+                    inputs=zt_x,
+                    create_graph=create_graph,
+                    retain_graph=True,
+                    allow_unused=False,
+                )[0]
+
         if (float(self.lambda_hjb) > 0.0) or (float(self.lambda_consistency) > 0.0):
             assert pred_ligand is not None
             assert zt_x is not None
@@ -767,7 +859,7 @@ class EnergyForceDiffusion(pl.LightningModule):
                     pred_ligand["v"].to(dtype=ligand["x"].dtype),
                     pred_ligand["energy"].to(dtype=ligand["x"].dtype).view(-1),
                     zt_x,
-                    t,
+                    t_used,
                     ligand["mask"],
                     temperature=temperature,
                     reduce=self.loss_reduce,
@@ -778,71 +870,47 @@ class EnergyForceDiffusion(pl.LightningModule):
                     trace_batch_size=trace_batch_size,
                     compute_hjb=(float(self.lambda_hjb) > 0.0),
                     compute_consistency=(float(self.lambda_consistency) > 0.0),
+                    du_dx=du_dx_shared,
                     debug=hjb_debug,
                 )
 
-        ######## Boundary conditions at t=0 (clean) ########
-
-        need_energy_t0 = (energy is not None) and (float(self.lambda_energy) > 0.0)
-        need_force_t0 = (force is not None) and (float(getattr(self, "lambda_force_t0", 0.0)) > 0.0)
-
+        ######## Boundary conditions at t=0 (clean), computed on a subset of graphs. ########
         if need_energy_t0 or need_force_t0:
-            t_clean = torch.zeros_like(t)
+            if pred_ligand is None:
+                raise RuntimeError("Internal error: boundary losses requested but pred_ligand is missing")
+            if is_t0_graph is None:
+                raise RuntimeError("Internal error: is_t0_graph missing")
 
-            # Force boundary needs gradients w.r.t. x; Lightning eval loops run under no_grad.
-            if need_force_t0 and (not torch.is_grad_enabled()):
-                force_grad_ctx = torch.enable_grad()
-            else:
-                force_grad_ctx = nullcontext()
-
-            with force_grad_ctx:
-                if need_force_t0:
-                    x_clean = ligand["x"].detach().requires_grad_(True)
-                else:
-                    x_clean = ligand["x"]
-
-                pred_clean, _ = self.dynamics(
-                    x_clean,
-                    ligand["one_hot"],
-                    ligand["mask"],
-                    pocket=None,
-                    t=t_clean,
-                    temperature=temperature,
-                    bonds_ligand=None,
-                    sc_transform=None,
-                )
+            if bool(is_t0_graph.any()):
+                if need_energy_t0:
+                    assert energy is not None
+                    energy_tgt = energy.to(device=ligand["x"].device, dtype=ligand["x"].dtype).view(-1)
+                    energy_pred = pred_ligand["energy"].to(dtype=ligand["x"].dtype).view(-1)
+                    if energy_pred.shape != energy_tgt.shape:
+                        raise ValueError(
+                            f"energy_pred must have shape (B,), got {tuple(energy_pred.shape)} vs target {tuple(energy_tgt.shape)}"
+                        )
+                    loss_energy = (energy_pred - energy_tgt) ** 2
+                    loss_energy = loss_energy * is_t0_graph.to(dtype=loss_energy.dtype)
 
                 if need_force_t0:
                     assert force is not None
-                    energy_pred_clean = pred_clean["energy"].to(dtype=ligand["x"].dtype).view(-1)
-                    du_dx = torch.autograd.grad(
-                        outputs=energy_pred_clean.sum(),
-                        inputs=x_clean,
-                        create_graph=bool(self.training),
-                        # If we also compute an energy boundary loss using the same forward
-                        # pass, we must retain the graph so the final loss.backward() can
-                        # traverse it again.
-                        retain_graph=bool(need_energy_t0),
-                        allow_unused=False,
-                    )[0]
-                    force_pred = -du_dx
+                    if du_dx_shared is None:
+                        raise RuntimeError("Internal error: force boundary requested but du_dx_shared is missing")
+                    force_pred = -du_dx_shared
                     force_tgt = force.to(device=ligand["x"].device, dtype=ligand["x"].dtype)
                     if force_tgt.shape != force_pred.shape:
                         raise ValueError(
                             f"force must have shape {tuple(force_pred.shape)} to match -dE/dx, got {tuple(force_tgt.shape)}"
                         )
+                    is_t0_node = is_t0_graph[ligand["mask"]]
                     per_node = torch.sum((force_pred - force_tgt) ** 2, dim=-1)
+                    per_node = per_node * is_t0_node.to(dtype=per_node.dtype)
                     loss_force_t0 = scatter_mean(per_node / float(self.x_dim), ligand["mask"], dim=0)
-
-            if need_energy_t0:
-                assert energy is not None
-                energy_tgt = energy.to(device=ligand["x"].device, dtype=ligand["x"].dtype).view(-1)
-                energy_pred = pred_clean["energy"].to(dtype=ligand["x"].dtype).view(-1)
-                if energy_pred.shape != energy_tgt.shape:
-                    raise ValueError(
-                        f"energy_pred must have shape (B,), got {tuple(energy_pred.shape)} vs target {tuple(energy_tgt.shape)}"
-                    )
-                loss_energy = (energy_pred - energy_tgt) ** 2
+            else:
+                # No t=0 graphs in this batch.
+                loss_energy = torch.zeros_like(loss_x)
+                loss_force_t0 = torch.zeros_like(loss_x)
 
             # print("True energy:", energy_tgt[:5].detach().cpu().numpy())
             # print("Pred energy:", energy_pred[:5].detach().cpu().numpy())
@@ -856,7 +924,7 @@ class EnergyForceDiffusion(pl.LightningModule):
             assert eps_x is not None
             # Build target velocity in diffusion time t (0 clean -> 1 noisy).
             # For VE: x(t) = x0 + sigma(t) * eps  =>  v_target = dx/dt = d_sigma/dt * eps.
-            t_det = t.detach()  # avoid building higher-order graphs unnecessarily
+            t_det = t_used.detach()  # avoid building higher-order graphs unnecessarily
             sigma_min = float(self.module_x.sde.sigma_min)
             sigma_max = float(self.module_x.sde.sigma_max)
             log_ratio = float(np.log(sigma_max / sigma_min))
@@ -869,7 +937,7 @@ class EnergyForceDiffusion(pl.LightningModule):
             # Optional SNR weighting (VE: SNR = 1/sigma(t)^2) to emphasize noisier steps
             # less and clamp gradients at very high SNR (near-clean) if requested.
             if self.cfm_weight_by_snr:
-                sigma_t = self.module_x.sigma(t, temperature=temperature)[ligand["mask"]].squeeze(-1)
+                sigma_t = self.module_x.sigma(t_used, temperature=temperature)[ligand["mask"]].squeeze(-1)
                 snr = 1.0 / torch.clamp(sigma_t * sigma_t, min=1e-12)
                 if self.cfm_use_min_snr:
                     snr = torch.clamp(snr, max=float(self.cfm_min_snr_gamma))
@@ -900,6 +968,13 @@ class EnergyForceDiffusion(pl.LightningModule):
             "diffuse_h": bool(self.diffuse_h and (self.lambda_h is None or float(self.lambda_h) != 0.0)),
         }
 
+        # Optional: log the (scheduled) t=0 fraction used for boundary losses.
+        if (need_energy_t0 or need_force_t0) and need_main_pass:
+            # frac_used is defined only in that branch; recompute a safe proxy here.
+            info["t0_batch_fraction_target"] = float(np.clip(float(getattr(self, "t0_batch_fraction", 1.0)), 0.0, 1.0))
+            if is_t0_graph is not None:
+                info["t0_batch_fraction_effective"] = float(is_t0_graph.float().mean().detach().cpu().item())
+
         if self.log_diffusion_stats and need_noisy_pass and (pred_ligand is not None) and (zt_x is not None):
             with torch.no_grad():
                 sigma_b = self.module_x.sigma(t.detach(), temperature=temperature).view(-1)
@@ -924,17 +999,22 @@ class EnergyForceDiffusion(pl.LightningModule):
         t = None
         t_low = float(self.t_min)
         t_high = float(self.t_max)
-        if self.time_horizon_schedule == "sinusoidal":
-            try:
-                n_batches = int(getattr(self.trainer, "num_training_batches", 0) or 0)
-                n_epochs = int(getattr(self.trainer, "max_epochs", 0) or getattr(self._train_params, "n_epochs", 0) or 0)
-            except Exception:
-                n_batches = 0
-                n_epochs = int(getattr(self._train_params, "n_epochs", 0) or 0)
 
-            if n_batches > 0 and n_epochs > 0:
-                total_steps = int(n_epochs * n_batches)
-                step = int(self.current_epoch) * int(n_batches) + int(batch_idx)
+        # Step bookkeeping (used by both time-horizon curriculum and t=0-fraction schedule).
+        step: int | None = None
+        total_steps: int | None = None
+        try:
+            n_batches = int(getattr(self.trainer, "num_training_batches", 0) or 0)
+            n_epochs = int(getattr(self.trainer, "max_epochs", 0) or getattr(self._train_params, "n_epochs", 0) or 0)
+        except Exception:
+            n_batches = 0
+            n_epochs = int(getattr(self._train_params, "n_epochs", 0) or 0)
+        if n_batches > 0 and n_epochs > 0:
+            total_steps = int(n_epochs * n_batches)
+            step = int(self.current_epoch) * int(n_batches) + int(batch_idx)
+
+        if self.time_horizon_schedule == "sinusoidal":
+            if (step is not None) and (total_steps is not None) and (total_steps > 0):
                 t_high = min(float(self.t_max), float(self._time_horizon_t_max_for_step(step, total_steps)))
                 if t_high < t_low:
                     t_high = t_low
@@ -947,6 +1027,8 @@ class EnergyForceDiffusion(pl.LightningModule):
             energy=batch.get("energy", None),
             force=batch.get("force", None),
             t=t,
+            step=step,
+            total_steps=total_steps,
             return_info=True,
         )
         # Log the timestep sampling bounds used for this batch.

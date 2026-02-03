@@ -72,6 +72,11 @@ loss_params:
   # (Set to 0.0 to disable.)
   lambda_force_t0: 0.0
 
+  # Fraction of graphs in each batch forced to t=0 (clean) for boundary energy/force losses.
+  # The remaining graphs keep their sampled diffusion time.
+  # Using a smaller fraction reduces the cost of the autograd force term.
+  t0_batch_fraction: 0.1
+
 
   # HJB divergence estimator:
   #   - hutchinson: memory-efficient stochastic trace estimator (recommended)

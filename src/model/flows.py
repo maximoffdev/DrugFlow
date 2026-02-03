@@ -867,6 +867,7 @@ class CoordScoreDiffusion:
         t: torch.Tensor,
         batch_mask: torch.Tensor,
         *,
+        du_dx: torch.Tensor | None = None,
         temperature: torch.Tensor | float | None = None,
         reduce: str = "mean",
         divergence: Literal["exact", "hutchinson"] = "exact",
@@ -955,13 +956,17 @@ class CoordScoreDiffusion:
             du_dt = torch.zeros((B,), device=x.device, dtype=x.dtype)
 
         if need_du_dx:
-            du_dx = torch.autograd.grad(
-                outputs=u_pred.sum(),
-                inputs=x,
-                create_graph=create_graph,
-                retain_graph=True,
-                allow_unused=False,
-            )[0]
+            if du_dx is None:
+                du_dx = torch.autograd.grad(
+                    outputs=u_pred.sum(),
+                    inputs=x,
+                    create_graph=create_graph,
+                    retain_graph=True,
+                    allow_unused=False,
+                )[0]
+            else:
+                if du_dx.shape != x.shape:
+                    raise ValueError(f"du_dx must have shape {tuple(x.shape)}; got {tuple(du_dx.shape)}")
         else:
             du_dx = torch.zeros_like(x)
 
