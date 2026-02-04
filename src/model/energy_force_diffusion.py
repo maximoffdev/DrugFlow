@@ -118,6 +118,13 @@ class EnergyForceDiffusion(pl.LightningModule):
         # The remaining graphs keep their sampled diffusion times.
         set_default(loss_params, "t0_batch_fraction", 1.0)
         self.t0_batch_fraction = float(getattr(loss_params, "t0_batch_fraction", 1.0))
+
+        # Avoid conditioning exactly at t=0 for the boundary subset by using a small epsilon time.
+        # This keeps coordinates clean (we still override zt_x for the boundary graphs) but can
+        # reduce endpoint numerical issues in time embeddings / schedules.
+        # Set to 0.0 to recover exact t=0 conditioning.
+        set_default(loss_params, "t0_time_epsilon", 1.0e-3)
+        self.t0_time_epsilon = float(getattr(loss_params, "t0_time_epsilon", 1.0e-3))
         self.lambda_cfm = loss_params.lambda_cfm
         self.lambda_hjb = loss_params.lambda_hjb
         self.lambda_consistency = loss_params.lambda_consistency
@@ -715,7 +722,8 @@ class EnergyForceDiffusion(pl.LightningModule):
                         idx = torch.arange(n_t0, device=ligand["x"].device)
                     is_t0_graph[idx] = True
                     t_used = t.clone()
-                    t_used[is_t0_graph] = 0.0
+                    t0_eps = float(np.clip(float(getattr(self, "t0_time_epsilon", 0.0)), 0.0, 1.0))
+                    t_used[is_t0_graph] = t0_eps
 
             # Coordinates: perturb the clean sample x (t=0 clean) with sigma(t) (t=1 most noisy)
             # Then override the t=0 subset to use the exact clean coordinates.
@@ -975,7 +983,7 @@ class EnergyForceDiffusion(pl.LightningModule):
             if is_t0_graph is not None:
                 info["t0_batch_fraction_effective"] = float(is_t0_graph.float().mean().detach().cpu().item())
 
-        if self.log_diffusion_stats and need_noisy_pass and (pred_ligand is not None) and (zt_x is not None):
+        if self.log_diffusion_stats and (pred_ligand is not None) and (zt_x is not None):
             with torch.no_grad():
                 sigma_b = self.module_x.sigma(t.detach(), temperature=temperature).view(-1)
                 v = pred_ligand["v"].detach()

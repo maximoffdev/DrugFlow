@@ -77,6 +77,10 @@ loss_params:
   # Using a smaller fraction reduces the cost of the autograd force term.
   t0_batch_fraction: 0.1
 
+  # Use epsilon time instead of exact t=0 for the boundary subset (coordinates are still kept clean).
+  # Set to 0.0 to recover exact t=0 conditioning.
+  t0_time_epsilon: 1.0e-3
+
 
   # HJB divergence estimator:
   #   - hutchinson: memory-efficient stochastic trace estimator (recommended)
