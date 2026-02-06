@@ -9,6 +9,7 @@ channels:
 
 dependencies:
   - python=3.11.8
+  - h5py
   - pytorch=2.2.1=*cuda12.1*
   - pytorch-cuda=12.1
   - pytorch-lightning=2.2.1

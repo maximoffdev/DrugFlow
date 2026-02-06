@@ -1,0 +1,150 @@
+run_name: energy_force_abi1x_test
+model_type: energy_force_diffusion
+
+# Required by src/train.py even if unused by EnergyForceDiffusion
+pocket_representation: CA+
+virtual_nodes: null
+flexible: False
+flexible_bb: False
+
+autoregressive: False
+
+dpo_mode: null
+
+train_params:
+  logdir: ./runs
+  # ANI-style HDF5 file (adjust if needed)
+  datadir: /media/data/qm_dataset/ani1x-release.h5
+  dataset_format: ani_h5
+  enable_progress_bar: True
+  num_sanity_val_steps: 0
+
+  batch_size: 32
+  accumulate_grad_batches: 2
+  lr: 5.0e-4
+  n_epochs: 1000
+  num_workers: 0
+  gpus: 1
+  clip_grad: True
+  gradient_clip_val: 1.0
+
+  # Debugging: log t/sigma/score statistics to WandB.
+  log_diffusion_stats: False
+
+  # PKL schema keys
+  pkl_pos_key: pos
+  pkl_atom_types_key: atomic_numbers
+  pkl_energy_key: e_total
+  pkl_forces_key: forces
+  pkl_atom_types_format: atomic_numbers
+
+  # QM9 elements (typically H/C/N/O/F)
+  pkl_allowed_atomic_numbers: [1, 6, 7, 8, 9]
+
+  # Flat-dir deterministic split
+  pkl_val_fraction: 0.01
+  pkl_val_n: null
+  pkl_split_seed: 42
+
+  # Optional: limit files for debugging, for full dataset use null
+  pkl_file_limit: null
+
+wandb_params:
+  mode: offline  # disabled, offline, online
+  entity:
+  group: qm9_curated
+
+loss_params:
+  discrete_loss: CE  # CE or VLB
+
+  # Loss weights
+  lambda_cfm: 0.0
+  cfm_weight_by_snr: True
+  cfm_use_min_snr: True
+  cfm_min_snr_gamma: 5.0
+
+  lambda_h: 0.0
+  lambda_energy: 1.0
+
+  lambda_hjb: 1.0
+  lambda_consistency: 1.0
+
+  # Boundary condition at t=0: match forces via force_pred = -dE/dx.
+  # (Set to 0.0 to disable.)
+  lambda_force_t0: 1.0
+
+  # Fraction of graphs in each batch forced to t=0 (clean) for boundary energy/force losses.
+  # The remaining graphs keep their sampled diffusion time.
+  # Using a smaller fraction reduces the cost of the autograd force term.
+  t0_batch_fraction: 0.9
+
+  # Use epsilon time instead of exact t=0 for the boundary subset (coordinates are still kept clean).
+  # Set to 0.0 to recover exact t=0 conditioning.
+  t0_time_epsilon: 1.0e-3
+
+
+  # HJB divergence estimator:
+  #   - hutchinson: memory-efficient stochastic trace estimator (recommended)
+  #   - exact: exact trace(dF/dx) (very memory-heavy)
+  hjb_divergence: exact
+  hjb_trace_samples: 1
+  # If false, computes HJB terms without enabling higher-order gradients (useful for logging only).
+  hjb_enable_higher_order: True
+  reduce: mean
+
+simulation_params:
+  n_steps: 1000
+
+  # Optional per-epoch time-horizon curriculum (mirrors notebooks/test.ipynb).
+  # When enabled, sample t ~ Uniform([t_min, t_max_epoch]) with sinusoidal growth.
+  time_horizon_schedule: constant  # constant | sinusoidal
+  time_horizon_warmup_fraction: 0.1
+  time_horizon_plateau_start_fraction: 0.8
+  time_horizon_t_min: 0.01
+  time_horizon_t_final: 1.0
+
+  center_ligand: True
+
+  enforce_zero_com_noise: True
+  project_predicted_v_zero_com: True
+  diffuse_h: False
+
+  # Score diffusion noise schedule for coordinates (t=0 noise -> t=1 clean)
+  sigma_min: 0.01
+  sigma_max: 5.0
+  coord_sde_kind: ve
+
+  # Temperature conditioning
+  use_temperature: False
+  temperature: 1.0
+  temperature_min: 1.0
+  temperature_max: 1.0
+
+eval_params:
+  eval_batch_size: 32
+  eval_epochs: 1
+  n_loss_per_sample: 1
+
+predictor_params:
+  backbone: gvp
+  condition_time: True
+  condition_temperature: False  # ignored; temperature conditioning follows simulation_params.use_temperature
+  
+  # Radius graph construction (ligand-only)
+  edge_cutoff_ligand: 50.0
+  knn_k: 50
+  
+  # Node scalar hidden size used by heads/decoders
+  hidden_nf: 128
+  
+  # GVP geometry / featurization
+  reflection_equivariant: False
+  d_max: 50.0
+  num_rbf: 16
+  
+  gvp_params:
+    n_layers: 5
+    node_h_dim: [ 128, 32 ]  # (s, V)
+    edge_h_dim: [ 128, 32 ]
+    dropout: 0.0
+    vector_gate: True

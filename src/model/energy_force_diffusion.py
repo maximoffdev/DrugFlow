@@ -13,6 +13,7 @@ import torch
 from torch_scatter import scatter_add, scatter_mean
 
 from src.data.pkl_dataset import PKLEnergyForceDataset, PKLKeys, split_pkl_file_paths
+from src.data.ani_h5_dataset import make_ani_h5_dataset_for_stage
 from src.model.diffusion_utils import DistributionNodes
 from src.model.dynamics_radius_gvp import RadiusGVPDynamics, RadiusGVPParams
 from src.model.dynamics_radius_mlp import RadiusMLPDynamics, RadiusMLPParams
@@ -415,8 +416,37 @@ class EnergyForceDiffusion(pl.LightningModule):
         sine_factor = 0.5 * (1.0 - float(np.cos(progress * float(np.pi))))
         return t_min + (t_final - t_min) * sine_factor
 
-    def _make_dataset(self, stage: str) -> PKLEnergyForceDataset:
+    def _make_dataset(self, stage: str):
         datadir = Path(self.datadir)
+
+        dataset_format = str(getattr(self._train_params, "dataset_format", "pkl")).lower()
+        if dataset_format == "auto":
+            dataset_format = "ani_h5" if (datadir.is_file() and datadir.suffix.lower() in {".h5", ".hdf5"}) else "pkl"
+
+        if dataset_format == "ani_h5":
+            allowed_z = list(self._train_params.pkl_allowed_atomic_numbers)
+            return make_ani_h5_dataset_for_stage(
+                datadir,
+                stage=stage,
+                allowed_atomic_numbers=allowed_z,
+                num_atom_types=len(allowed_z),
+                val_fraction=float(self._train_params.pkl_val_fraction),
+                seed=int(self._train_params.pkl_split_seed),
+                val_n=self._train_params.pkl_val_n,
+                atomic_numbers_key=str(getattr(self._train_params, "h5_atomic_numbers_key", "atomic_numbers")),
+                coordinates_key=str(getattr(self._train_params, "h5_coordinates_key", "coordinates")),
+                energy_key=str(getattr(self._train_params, "h5_energy_key", "wb97x_dz.energy")),
+                forces_key=str(getattr(self._train_params, "h5_forces_key", "wb97x_dz.forces")),
+                filter_nan=bool(getattr(self._train_params, "h5_filter_nan", True)),
+                scan_limit_groups=getattr(self._train_params, "h5_scan_limit_groups", None),
+                scan_chunk_size=int(getattr(self._train_params, "h5_scan_chunk_size", 128)),
+                conformation_limit=getattr(self._train_params, "h5_conformation_limit", None),
+                device="cpu",
+            )
+
+        if dataset_format != "pkl":
+            raise ValueError("train_params.dataset_format must be one of: pkl, ani_h5, auto")
+
         stage_dir = datadir / stage
 
         keys = PKLKeys(
@@ -482,7 +512,7 @@ class EnergyForceDiffusion(pl.LightningModule):
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            collate_fn=PKLEnergyForceDataset.collate_fn,
+            collate_fn=type(self.train_dataset).collate_fn,
             pin_memory=True,
             drop_last=False,
         )
@@ -498,7 +528,7 @@ class EnergyForceDiffusion(pl.LightningModule):
             batch_size=self.eval_batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=PKLEnergyForceDataset.collate_fn,
+            collate_fn=type(self.val_dataset).collate_fn,
             pin_memory=True,
             drop_last=False,
         )
@@ -514,7 +544,7 @@ class EnergyForceDiffusion(pl.LightningModule):
             batch_size=self.eval_batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=PKLEnergyForceDataset.collate_fn,
+            collate_fn=type(self.test_dataset).collate_fn,
             pin_memory=True,
             drop_last=False,
         )
@@ -536,7 +566,9 @@ class EnergyForceDiffusion(pl.LightningModule):
 
     def setup_sampling(self):
         # Match DrugFlow behavior: sample molecule sizes from histogram.
-        histogram_file = Path(self.datadir, "size_distribution.npy")
+        datadir = Path(self.datadir)
+        base_dir = datadir.parent if datadir.is_file() else datadir
+        histogram_file = base_dir / "size_distribution.npy"
         if not histogram_file.exists():
             # Fallback to repo default histogram.
             src_dir = Path(__file__).resolve().parents[1]
