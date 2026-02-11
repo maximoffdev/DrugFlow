@@ -1,3 +1,6 @@
+import os
+os.environ["WANDB_SERVICE_WAIT"] = "300"
+
 import warnings
 import tempfile
 from typing import Optional, Union

@@ -1,3 +1,6 @@
+import os
+os.environ["WANDB_SERVICE_WAIT"] = "300"
+
 from typing import Optional
 from pathlib import Path
 from functools import partial

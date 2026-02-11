@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+os.environ["WANDB_SERVICE_WAIT"] = "300"
+
 from argparse import Namespace
 from typing import Literal, cast
 from pathlib import Path

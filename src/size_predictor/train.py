@@ -1,3 +1,6 @@
+import os
+os.environ["WANDB_SERVICE_WAIT"] = "300"
+
 import argparse
 from argparse import Namespace
 from pathlib import Path
