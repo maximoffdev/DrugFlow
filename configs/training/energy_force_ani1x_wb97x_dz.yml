@@ -22,7 +22,7 @@ train_params:
   batch_size: 32
   accumulate_grad_batches: 2
   lr: 5.0e-4
-  n_epochs: 1000
+  n_epochs: 50
   num_workers: 0
   gpus: 1
   clip_grad: True
@@ -69,17 +69,18 @@ loss_params:
   lambda_hjb: 1.0
   lambda_consistency: 1.0
 
-  # Boundary condition at t=0: match forces via force_pred = -dE/dx.
+  # Boundary condition at the clean endpoint (flow-time t≈1): match forces via force_pred = -dE/dx.
+  # NOTE: Flag name is legacy (`*_t0`). Under the current convention t=0 is most noisy and t=1 is clean.
   # (Set to 0.0 to disable.)
   lambda_force_t0: 1.0
 
-  # Fraction of graphs in each batch forced to t=0 (clean) for boundary energy/force losses.
+  # Fraction of graphs in each batch forced to the clean endpoint (t≈1) for boundary energy/force losses.
   # The remaining graphs keep their sampled diffusion time.
   # Using a smaller fraction reduces the cost of the autograd force term.
   t0_batch_fraction: 0.9
 
-  # Use epsilon time instead of exact t=0 for the boundary subset (coordinates are still kept clean).
-  # Set to 0.0 to recover exact t=0 conditioning.
+  # Use epsilon time instead of exact t=1 for the boundary subset (coordinates are still kept clean).
+  # Set to 0.0 to recover exact t=1 conditioning.
   t0_time_epsilon: 1.0e-3
 
 
@@ -97,9 +98,9 @@ simulation_params:
 
   # Optional per-epoch time-horizon curriculum (mirrors notebooks/test.ipynb).
   # When enabled, sample t ~ Uniform([t_min, t_max_epoch]) with sinusoidal growth.
-  time_horizon_schedule: constant  # constant | sinusoidal
+  time_horizon_schedule: sinusoidal  # constant | sinusoidal
   time_horizon_warmup_fraction: 0.1
-  time_horizon_plateau_start_fraction: 0.8
+  time_horizon_plateau_start_fraction: 0.5
   time_horizon_t_min: 0.01
   time_horizon_t_final: 1.0
 

@@ -199,7 +199,7 @@ class RadiusGVPDynamics(nn.Module):
         pred_ligand = {
             "logits_h": logits_h,
             "energy": energy,
-            "v": v,
+            "force": v,
         }
         pred_residues = {}
         return pred_ligand, pred_residues
