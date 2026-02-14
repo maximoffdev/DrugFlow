@@ -5,10 +5,16 @@ import argparse
 from argparse import Namespace
 from pathlib import Path
 import warnings
+from typing import List
 
 import torch
 import pytorch_lightning as pl
 import yaml
+
+from pytorch_lightning.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.loggers import WandbLogger
+
+pl_version = getattr(pl, "__version__", "0.0.0")
 
 torch.set_float32_matmul_precision("high")   # or "medium"
 
@@ -21,35 +27,39 @@ from src.model.lightning import DrugFlow
 from src.model.dpo import DPO
 from src.model.energy_force_diffusion import EnergyForceDiffusion
 from src.utils import set_deterministic, disable_rdkit_logging, dict_to_namespace, namespace_to_dict
+from src.file_logger import PlainFileLogger
 
 
 def merge_args_and_yaml(args, config_dict):
     arg_dict = args.__dict__
     for key, value in config_dict.items():
         if key in arg_dict:
-            warnings.warn(f"Command line argument '{key}' (value: "
-                          f"{arg_dict[key]}) will be overwritten with value "
-                          f"{value} provided in the config file.")
-        # if isinstance(value, dict):
-        #     arg_dict[key] = Namespace(**value)
-        # else:
-        #     arg_dict[key] = value
+            warnings.warn(
+                f"Command line argument '{key}' (value: {arg_dict[key]}) "
+                f"will be overwritten with value {value} provided in the config file."
+            )
         arg_dict[key] = dict_to_namespace(value)
 
     return args
-
-
 def merge_configs(config, resume_config):
+    """Merge a checkpoint config into the current config.
+
+    When resuming (not finetuning), we generally want to keep hyperparameters
+    consistent with the original run stored in the checkpoint.
+    """
+
     for key, value in resume_config.items():
         if isinstance(value, Namespace):
             value = value.__dict__
 
-        if isinstance(value, dict):
-            # update dictionaries recursively
-            value = merge_configs(config[key], value)
+        if isinstance(value, dict) and key in config and isinstance(config.get(key), dict):
+            config[key] = merge_configs(config[key], value)
+            continue
 
         if key in config and config[key] != value:
-            print(f'[CONFIG UPDATE] {key}: {value} -> {config[key]}')
+            print(f'[CONFIG UPDATE] {key}: {config[key]} -> {value}')
+        config[key] = value
+
     return config
 
 
@@ -95,6 +105,7 @@ if __name__ == "__main__":
     # Get main config
     ckpt_path = None if args.resume is None else Path(args.resume)
     if args.resume is not None and not args.finetune:
+        assert ckpt_path is not None
         ckpt = torch.load(ckpt_path, map_location=torch.device('cpu'))
         print(f'Resuming from epoch {ckpt["epoch"]}')
         resume_config = ckpt['hyper_parameters']
@@ -149,30 +160,34 @@ if __name__ == "__main__":
         })
     pl_module = model_class(**model_args)
 
-    resume_logging = False
-    if args.finetune:
-        resume_logging = 'allow'
-    elif args.resume is not None:
-        resume_logging = 'must'
-    
-    logger = pl.loggers.WandbLogger(
-        save_dir=args.train_params.logdir,
-        project='FlexFlow',
-        group=args.wandb_params.group,
-        name=args.run_name,
-        id=args.run_name,
-        resume=resume_logging,
-        entity=args.wandb_params.entity,
-        mode=args.wandb_params.mode,
-    )
+    wandb_mode = getattr(args.wandb_params, 'mode', 'online')
+    if wandb_mode == 'disabled':
+        logger = PlainFileLogger(save_dir=args.train_params.logdir, filename='logfile')
+    else:
+        resume_logging = False
+        if args.finetune:
+            resume_logging = 'allow'
+        elif args.resume is not None:
+            resume_logging = 'must'
 
-    checkpoint_callbacks = [
-        pl.callbacks.ModelCheckpoint(
+        logger = WandbLogger(
+            save_dir=args.train_params.logdir,
+            project='FlexFlow',
+            group=args.wandb_params.group,
+            name=args.run_name,
+            id=args.run_name,
+            resume=resume_logging,
+            entity=args.wandb_params.entity,
+            mode=wandb_mode,
+        )
+
+    checkpoint_callbacks: List[Callback] = [
+        ModelCheckpoint(
             dirpath=checkpoints_root_dir,
             save_last=True,
             save_on_train_epoch_end=True,
         ),
-        pl.callbacks.ModelCheckpoint(
+        ModelCheckpoint(
             dirpath=Path(checkpoints_root_dir, 'val_loss'),
             filename="epoch_{epoch:04d}_loss_{loss/val:.3f}",
             monitor="loss/val",
@@ -183,9 +198,9 @@ if __name__ == "__main__":
     ]
 
     # For learning rate logging
-    lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval='step')
+    lr_monitor = LearningRateMonitor(logging_interval='step')
 
-    default_strategy = 'auto' if pl.__version__ >= '2.0.0' else None
+    default_strategy = 'auto' if pl_version >= '2.0.0' else None
 
     trainer_kwargs = {}
     # EnergyForceDiffusion currently expects Trainer-level gradient clipping (its config
@@ -197,24 +212,40 @@ if __name__ == "__main__":
         trainer_kwargs["gradient_clip_val"] = float(clip_val)
         trainer_kwargs["gradient_clip_algorithm"] = "norm"
 
+    trainer_kwargs_strategy = {}
+    if args.train_params.gpus > 1:
+        trainer_kwargs_strategy["strategy"] = 'ddp_find_unused_parameters_true'
+    elif default_strategy is not None:
+        trainer_kwargs_strategy["strategy"] = default_strategy
+
+    callbacks: List[Callback] = checkpoint_callbacks + [lr_monitor]
+
     trainer = pl.Trainer(
         max_epochs=args.train_params.n_epochs,
         logger=logger,
-        callbacks=checkpoint_callbacks + [lr_monitor],
+        callbacks=callbacks,
         enable_progress_bar=args.train_params.enable_progress_bar,
         check_val_every_n_epoch=args.eval_params.eval_epochs,
         num_sanity_val_steps=args.train_params.num_sanity_val_steps,
         accumulate_grad_batches=args.train_params.accumulate_grad_batches,
         accelerator='gpu' if args.train_params.gpus > 0 else 'cpu',
         devices=args.train_params.gpus if args.train_params.gpus > 0 else 'auto',
-        strategy=('ddp_find_unused_parameters_true' if args.train_params.gpus > 1 else default_strategy),
         use_distributed_sampler=True,
+        **trainer_kwargs_strategy,
         **trainer_kwargs,
     )
 
-    # add all arguments as dictionaries because WandB does not display
-    # nested Namespace objects correctly
-    logger.experiment.config.update({'as_dict': namespace_to_dict(args)}, allow_val_change=True)
+    # Add all arguments as a dictionary.
+    # - W&B: store in run config.
+    # - File logger (and other loggers): log as hyperparams.
+    args_as_dict = {'as_dict': namespace_to_dict(args)}
+    if isinstance(logger, WandbLogger):
+        logger.experiment.config.update(args_as_dict, allow_val_change=True)
+    else:
+        try:
+            logger.log_hyperparams(args_as_dict)
+        except Exception:
+            pass
 
     trainer.fit(model=pl_module, ckpt_path=ckpt_path)
 
