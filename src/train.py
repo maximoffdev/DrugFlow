@@ -30,6 +30,66 @@ from src.utils import set_deterministic, disable_rdkit_logging, dict_to_namespac
 from src.file_logger import PlainFileLogger
 
 
+class DataloaderShardDebugCallback(Callback):
+    def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if not bool(getattr(trainer, "is_global_zero", True)):
+            return
+        # Important: inspect the dataloader that the Trainer is actually using,
+        # because this is where Lightning may have injected a DistributedSampler.
+        dl = getattr(trainer, "train_dataloader", None)
+        if dl is None:
+            print("[DL SHARD DEBUG] trainer.train_dataloader is None", flush=True)
+            return
+
+        # Some PL versions expose it as a method.
+        if callable(dl):
+            try:
+                dl = dl()
+            except Exception as e:
+                print(f"[DL SHARD DEBUG] failed to resolve trainer.train_dataloader(): {e}", flush=True)
+                return
+
+        def _safe_len(obj):
+            try:
+                return len(obj)
+            except Exception:
+                return None
+
+        # Handle CombinedLoader (multiple loaders) vs. a single DataLoader.
+        combined_loaders = getattr(dl, "loaders", None)
+        if isinstance(combined_loaders, dict):
+            loaders = combined_loaders
+        else:
+            loaders = {"train": dl}
+
+        for name, dli in loaders.items():
+            sampler = getattr(dli, "sampler", None)
+            batch_sampler = getattr(dli, "batch_sampler", None)
+            dataset = getattr(dli, "dataset", None)
+
+            msg = {
+                "name": str(name),
+                "world_size": getattr(trainer, "world_size", None),
+                "global_rank": getattr(trainer, "global_rank", None),
+                "local_rank": int(os.environ.get("LOCAL_RANK", -1)),
+                "len(dataset)": (_safe_len(dataset) if dataset is not None else None),
+                "len(dataloader)": _safe_len(dli),
+                "sampler": (type(sampler).__name__ if sampler is not None else None),
+                "batch_sampler": (type(batch_sampler).__name__ if batch_sampler is not None else None),
+            }
+
+            # If DistributedSampler is present, expose its key attributes.
+            if sampler is not None and type(sampler).__name__ == "DistributedSampler":
+                msg.update({
+                    "sampler.num_replicas": getattr(sampler, "num_replicas", None),
+                    "sampler.rank": getattr(sampler, "rank", None),
+                    "sampler.shuffle": getattr(sampler, "shuffle", None),
+                    "sampler.drop_last": getattr(sampler, "drop_last", None),
+                })
+
+            print("[DL SHARD DEBUG]", msg, flush=True)
+
+
 def merge_args_and_yaml(args, config_dict):
     arg_dict = args.__dict__
     for key, value in config_dict.items():
@@ -218,7 +278,7 @@ if __name__ == "__main__":
     elif default_strategy is not None:
         trainer_kwargs_strategy["strategy"] = default_strategy
 
-    callbacks: List[Callback] = checkpoint_callbacks + [lr_monitor]
+    callbacks: List[Callback] = checkpoint_callbacks + [lr_monitor, DataloaderShardDebugCallback()]
 
     trainer = pl.Trainer(
         max_epochs=args.train_params.n_epochs,
