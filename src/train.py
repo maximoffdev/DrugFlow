@@ -222,7 +222,7 @@ if __name__ == "__main__":
 
     wandb_mode = getattr(args.wandb_params, 'mode', 'online')
     if wandb_mode == 'disabled':
-        logger = PlainFileLogger(save_dir=args.train_params.logdir, filename='logfile')
+        logger = PlainFileLogger(save_dir=args.train_params.logdir, filename=f"logfile_{args.run_name}")
     else:
         resume_logging = False
         if args.finetune:

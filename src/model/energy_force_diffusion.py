@@ -940,14 +940,15 @@ class EnergyForceDiffusion(pl.LightningModule):
                         raise ValueError(
                             f"energy_pred must have shape (B,), got {tuple(energy_pred.shape)} vs target {tuple(energy_tgt.shape)}"
                         )
-                    loss_energy = (energy_pred - energy_tgt) ** 2
+                    # Per-atom MAE on total energy.
+                    loss_energy = torch.abs(energy_pred - energy_tgt) / ligand["size"].to(dtype=energy_pred.dtype)
                     loss_energy = loss_energy * is_t0_graph.to(dtype=loss_energy.dtype)
 
                 if need_force_t0:
                     assert force is not None
-                    if du_dx_shared is None:
-                        raise RuntimeError("Internal error: force boundary requested but du_dx_shared is missing")
-                    force_pred = -du_dx_shared
+                    force_pred = pred_ligand.get("force", pred_ligand.get("v", None))
+                    if force_pred is None:
+                        raise RuntimeError("Internal error: force boundary requested but force_pred is missing")
                     force_tgt = force.to(device=ligand["x"].device, dtype=ligand["x"].dtype)
                     if force_tgt.shape != force_pred.shape:
                         raise ValueError(
@@ -956,7 +957,8 @@ class EnergyForceDiffusion(pl.LightningModule):
                     is_t0_node = is_t0_graph[ligand["mask"]]
                     per_node = torch.sum((force_pred - force_tgt) ** 2, dim=-1)
                     per_node = per_node * is_t0_node.to(dtype=per_node.dtype)
-                    loss_force_t0 = scatter_mean(per_node / float(self.x_dim), ligand["mask"], dim=0)
+                    # Per-atom mean squared L2 error on forces.
+                    loss_force_t0 = scatter_mean(per_node, ligand["mask"], dim=0)
             else:
                 # No t=0 graphs in this batch.
                 loss_energy = torch.zeros_like(loss_x)
