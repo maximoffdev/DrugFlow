@@ -129,6 +129,7 @@ def merge_configs(config, resume_config):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument('--config', type=str, required=True)
+    p.add_argument('--dataset_stats', type=str, default=None, help='Path to dataset stats YAML (sigma + omol_elem_refs)')
     p.add_argument('--resume', type=str, default=None)
     p.add_argument('--backoff', action='store_true')
     p.add_argument('--finetune', action='store_true')
@@ -170,6 +171,13 @@ if __name__ == "__main__":
         print(f'Resuming from epoch {ckpt["epoch"]}')
         resume_config = ckpt['hyper_parameters']
         config = merge_configs(config, resume_config)
+
+    # Optionally inject dataset stats (portable: store parsed YAML in checkpoint hparams).
+    if args.dataset_stats is not None:
+        with open(args.dataset_stats, 'r') as f:
+            stats = yaml.safe_load(f)
+        config.setdefault('train_params', {})
+        config['train_params']['dataset_stats'] = stats
 
     args = merge_args_and_yaml(args, config)
 

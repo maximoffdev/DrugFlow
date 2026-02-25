@@ -3,9 +3,11 @@ from typing import Union, Iterable
 import random
 # import argparse
 from argparse import Namespace
+from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 from rdkit import Chem, RDLogger
 from rdkit.Chem import KekulizeException, AtomKekulizeException
 import networkx as nx
@@ -285,7 +287,9 @@ def dict_to_namespace(input_dict):
         output_namespace = Namespace()
         output = output_namespace.__dict__
         for key, value in input_dict.items():
-            output[key] = dict_to_namespace(value)
+            # Namespace attribute keys must be strings. YAML often produces int keys
+            # (e.g., atomic numbers), which can break repr/logging (e.g., W&B config).
+            output[str(key)] = dict_to_namespace(value)
         return output_namespace
 
     elif isinstance(input_dict, Namespace):
@@ -309,3 +313,133 @@ def namespace_to_dict(x):
     for key, value in x.items():
         output[key] = namespace_to_dict(value)
     return output
+
+
+def parse_dataset_stats(dataset_stats: dict | Namespace | str | None) -> tuple[float, dict[int, float]]:
+    """Parse dataset stats for UMA-style scaling.
+
+    Expected fields:
+      - sigma: float (force RMS)
+      - omol_elem_refs: {Z: {0: E_atom}} (charge ignored; we take charge=0)
+    """
+    if dataset_stats is None:
+        return 1.0, {}
+
+    if isinstance(dataset_stats, str):
+        stats_path = Path(dataset_stats)
+        with open(stats_path, "r", encoding="utf-8") as f:
+            dataset_stats = yaml.safe_load(f)
+
+    if isinstance(dataset_stats, Namespace):
+        dataset_stats = namespace_to_dict(dataset_stats)
+
+    if not isinstance(dataset_stats, dict):
+        raise TypeError(f"dataset_stats must be dict/Namespace/path/None; got {type(dataset_stats).__name__}")
+
+    if "sigma" not in dataset_stats:
+        raise KeyError("dataset_stats is missing required key 'sigma'")
+    sigma = float(dataset_stats["sigma"])
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError(f"dataset_stats.sigma must be a positive finite float, got {sigma}")
+
+    elem_ref: dict[int, float] = {}
+    omol = dataset_stats.get("omol_elem_refs", None)
+    if omol is not None:
+        if not isinstance(omol, dict):
+            raise TypeError("dataset_stats.omol_elem_refs must be a dict")
+        for z_raw, charge_map in omol.items():
+            z = int(z_raw)
+            if isinstance(charge_map, Namespace):
+                charge_map = namespace_to_dict(charge_map)
+            if not isinstance(charge_map, dict):
+                raise TypeError(f"omol_elem_refs[{z}] must be a dict of charges->energy")
+            if 0 not in charge_map and "0" not in charge_map:
+                raise KeyError(f"omol_elem_refs[{z}] is missing charge 0 entry")
+            e0 = charge_map.get(0, charge_map.get("0"))
+            if e0 is None:
+                raise ValueError(f"omol_elem_refs[{z}][0] is None")
+            elem_ref[z] = float(e0)
+
+    return sigma, elem_ref
+
+
+def scale_target(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    return x / float(sigma)
+
+
+def unscale_target(x_scaled: torch.Tensor, sigma: float) -> torch.Tensor:
+    return x_scaled * float(sigma)
+
+
+def one_hot_to_atomic_numbers(one_hot: torch.Tensor, allowed_atomic_numbers: list[int] | torch.Tensor) -> torch.Tensor:
+    if isinstance(allowed_atomic_numbers, torch.Tensor):
+        allowed_z = allowed_atomic_numbers.to(device=one_hot.device, dtype=torch.long)
+    else:
+        allowed_z = torch.as_tensor(list(allowed_atomic_numbers), device=one_hot.device, dtype=torch.long)
+    idx = torch.argmax(one_hot, dim=-1).to(torch.long)
+    return allowed_z[idx]
+
+
+def sum_atomref_per_graph(
+    one_hot: torch.Tensor,
+    batch_mask: torch.Tensor,
+    *,
+    allowed_atomic_numbers: list[int] | torch.Tensor,
+    elem_ref: dict[int, float],
+) -> torch.Tensor:
+    """Compute \\sum_i E_atom(Z_i) per graph (B,).
+
+    Uses `elem_ref[Z]` values; charge is ignored.
+    """
+    if len(elem_ref) == 0:
+        # Infer batch size from mask.
+        b = int(batch_mask.max().item()) + 1 if batch_mask.numel() > 0 else 0
+        return torch.zeros((b,), device=one_hot.device, dtype=one_hot.dtype)
+
+    z = one_hot_to_atomic_numbers(one_hot, allowed_atomic_numbers)
+    present = set(int(v) for v in torch.unique(z).tolist())
+    missing = sorted(present.difference(set(int(k) for k in elem_ref.keys())))
+    if len(missing) > 0:
+        raise KeyError(f"Missing atomic reference energies for Z={missing}")
+
+    max_z = max(int(k) for k in elem_ref.keys())
+    lut = torch.zeros((max_z + 1,), device=z.device, dtype=one_hot.dtype)
+    for zz, ee in elem_ref.items():
+        if int(zz) <= max_z:
+            lut[int(zz)] = float(ee)
+    per_node = lut[z]
+    return scatter_add(per_node, batch_mask, dim=0)
+
+
+def reference_energy_per_graph(
+    energy_dft: torch.Tensor,
+    one_hot: torch.Tensor,
+    batch_mask: torch.Tensor,
+    *,
+    allowed_atomic_numbers: list[int] | torch.Tensor,
+    elem_ref: dict[int, float],
+) -> torch.Tensor:
+    e_atom_sum = sum_atomref_per_graph(
+        one_hot,
+        batch_mask,
+        allowed_atomic_numbers=allowed_atomic_numbers,
+        elem_ref=elem_ref,
+    ).to(dtype=energy_dft.dtype)
+    return energy_dft - e_atom_sum
+
+
+def unreference_energy_per_graph(
+    energy_ref: torch.Tensor,
+    one_hot: torch.Tensor,
+    batch_mask: torch.Tensor,
+    *,
+    allowed_atomic_numbers: list[int] | torch.Tensor,
+    elem_ref: dict[int, float],
+) -> torch.Tensor:
+    e_atom_sum = sum_atomref_per_graph(
+        one_hot,
+        batch_mask,
+        allowed_atomic_numbers=allowed_atomic_numbers,
+        elem_ref=elem_ref,
+    ).to(dtype=energy_ref.dtype)
+    return energy_ref + e_atom_sum

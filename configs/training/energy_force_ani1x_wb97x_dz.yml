@@ -22,7 +22,7 @@ train_params:
   batch_size: 32
   accumulate_grad_batches: 2
   lr: 5.0e-4
-  n_epochs: 50
+  n_epochs: 500
   num_workers: 0
   gpus: 1
   clip_grad: True
@@ -66,7 +66,7 @@ loss_params:
   lambda_h: 0.0
   lambda_energy: 1.0
 
-  lambda_hjb: 1.0
+  lambda_hjb: 0.0
   lambda_consistency: 1.0
 
   # Boundary condition at the clean endpoint (flow-time t≈1): match forces via force_pred = -dE/dx.

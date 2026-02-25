@@ -89,6 +89,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         # Training defaults
         set_default(train_params, "lr_step_size", None)
         set_default(train_params, "lr_gamma", None)
+        set_default(train_params, "dataset_stats", None)
         set_default(loss_params, "lambda_x", 1.0)
         set_default(loss_params, "lambda_h", 1.0)
         set_default(loss_params, "lambda_energy", 1.0)
@@ -111,6 +112,9 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.lr = train_params.lr
         self.lr_step_size = train_params.lr_step_size
         self.lr_gamma = train_params.lr_gamma
+
+        # UMA-style target scaling + (optional) energy referencing.
+        self.target_sigma, self.omol_elem_ref = utils.parse_dataset_stats(getattr(train_params, "dataset_stats", None))
 
         # Loss params
         self.loss_reduce = loss_params.reduce
@@ -940,6 +944,20 @@ class EnergyForceDiffusion(pl.LightningModule):
                         raise ValueError(
                             f"energy_pred must have shape (B,), got {tuple(energy_pred.shape)} vs target {tuple(energy_tgt.shape)}"
                         )
+
+                    # Energy referencing: E_ref = E_DFT - sum_i E_atom(Z_i). (Charge ignored: use 0.)
+                    if len(getattr(self, "omol_elem_ref", {})) > 0:
+                        e_atom_sum = utils.sum_atomref_per_graph(
+                            ligand["one_hot"],
+                            ligand["mask"],
+                            allowed_atomic_numbers=self.allowed_atomic_numbers,
+                            elem_ref=self.omol_elem_ref,
+                        ).to(dtype=energy_tgt.dtype)
+                        energy_tgt = energy_tgt - e_atom_sum
+
+                    # Target scaling: x_scaled = x / sigma (mu=0).
+                    energy_tgt = utils.scale_target(energy_tgt, float(getattr(self, "target_sigma", 1.0)))
+
                     # Per-atom MAE on total energy.
                     loss_energy = torch.abs(energy_pred - energy_tgt) / ligand["size"].to(dtype=energy_pred.dtype)
                     loss_energy = loss_energy * is_t0_graph.to(dtype=loss_energy.dtype)
@@ -954,6 +972,10 @@ class EnergyForceDiffusion(pl.LightningModule):
                         raise ValueError(
                             f"force must have shape {tuple(force_pred.shape)} to match -dE/dx, got {tuple(force_tgt.shape)}"
                         )
+
+                    # Target scaling: x_scaled = x / sigma (mu=0).
+                    force_tgt = utils.scale_target(force_tgt, float(getattr(self, "target_sigma", 1.0)))
+
                     is_t0_node = is_t0_graph[ligand["mask"]]
                     per_node = torch.sum((force_pred - force_tgt) ** 2, dim=-1)
                     per_node = per_node * is_t0_node.to(dtype=per_node.dtype)
@@ -1379,6 +1401,8 @@ class EnergyForceDiffusion(pl.LightningModule):
             F = pred_ligand.get("force", pred_ligand.get("v", None))
             if F is None:
                 raise KeyError("Dynamics must return 'force' (preferred) or legacy 'v'")
+            # Model is trained in scaled units; undo scaling for diffusion integration.
+            F = F * float(getattr(self, "target_sigma", 1.0))
             s_tau = 1.0 - s
             f = self.module_x._sde_f_forward(x, s_tau, batch_mask, temperature=sampler_temperature).to(dtype=x.dtype)
             g2 = self.module_x._sde_g2_forward(s_tau, temperature=sampler_temperature)  # (B,)

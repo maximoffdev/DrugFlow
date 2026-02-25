@@ -57,7 +57,7 @@ loss_params:
   discrete_loss: CE  # CE or VLB
 
   # Loss weights
-  lambda_cfm: 1.0
+  lambda_cfm: 0.0
   cfm_weight_by_snr: True
   cfm_use_min_snr: True
   cfm_min_snr_gamma: 5.0
@@ -66,17 +66,17 @@ loss_params:
   lambda_energy: 0.0
 
   lambda_hjb: 0.0
-  lambda_consistency: 1.0
+  lambda_consistency: 0.0
 
   # Boundary condition at the clean endpoint (flow-time t≈1): match forces via force_pred = -dE/dx.
   # NOTE: Flag name is legacy (`*_t0`). Under the current convention t=0 is most noisy and t=1 is clean.
   # (Set to 0.0 to disable.)
-  lambda_force_t0: 0.0
+  lambda_force_t0: 1.0
 
   # Fraction of graphs in each batch forced to the clean endpoint (t≈1) for boundary energy/force losses.
   # The remaining graphs keep their sampled diffusion time.
   # Using a smaller fraction reduces the cost of the autograd force term.
-  t0_batch_fraction: 0.1
+  t0_batch_fraction: 0.9
 
   # Use epsilon time instead of exact t=1 for the boundary subset (coordinates are still kept clean).
   # Set to 0.0 to recover exact t=1 conditioning.

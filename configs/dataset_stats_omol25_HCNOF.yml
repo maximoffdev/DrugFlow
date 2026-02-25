@@ -1,0 +1,30 @@
+# Dummy dataset stats file for UMA-style scaling.
+# - sigma: shared scale factor (force RMS). Here set to 1.0.
+# - omol_elem_refs: atomic reference energies keyed by atomic number and charge.
+#   The current pipeline uses the charge=0 entry for each element.
+
+sigma: 1.0
+
+omol_elem_refs:
+  1:
+    0: -13.445584057373376
+  2:
+    0: -78.82028064861346
+  3:
+    0: -203.32566089610248
+    1: -197.98591238912647
+  4:
+    0: -398.94745406238457
+    1: -389.9174065296533
+    2: -371.64022062627583
+  5:
+    0: -670.7528161616635
+  6:
+    0: -1029.854128936652
+  7:
+    0: -1485.5420268052571
+  8:
+    0: -2042.9785186843171
+  9:
+    0: -2714.2404072902364
+    -1: -2717.60644594991
