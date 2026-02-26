@@ -1,8 +1,10 @@
 import os
 import pickle
+import bisect
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -54,6 +56,7 @@ class PKLEnergyForceDataset(Dataset):
         scan_limit: int = 2048,
         device: str | torch.device = "cpu",
         file_limit: Optional[int] = None,
+        bundle_cache_size: int = 2,
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -63,6 +66,7 @@ class PKLEnergyForceDataset(Dataset):
         self.allowed_atomic_numbers = list(allowed_atomic_numbers) if allowed_atomic_numbers is not None else None
         self.scan_limit = int(scan_limit)
         self.device = device
+        self.bundle_cache_size = int(bundle_cache_size)
 
         if file_paths is not None:
             fps = [Path(p) for p in file_paths]
@@ -73,10 +77,47 @@ class PKLEnergyForceDataset(Dataset):
             fps = fps[:file_limit]
         self.file_paths: List[Path] = list(fps)
 
+        # Build a molecule-level index so we can handle pkls that contain multiple structures.
+        # This scans each file once at initialization to determine how many molecules it contains.
+        self._cum_counts: List[int] = [0]
+        inferred_atomic_numbers: Optional[set[int]] = set() if (self.atom_types_format == "atomic_numbers" and self.allowed_atomic_numbers is None) else None
+        scanned_mols = 0
+
+        for fp in self.file_paths:
+            items, _names = self._load_as_items(fp)
+            n_items = len(items)
+            if n_items <= 0:
+                raise ValueError(f"Bundle {fp.name} contains zero items")
+
+            # Optional atomic number inference (scan first `scan_limit` molecules across the dataset)
+            if inferred_atomic_numbers is not None and scanned_mols < self.scan_limit:
+                for obj in items:
+                    if scanned_mols >= self.scan_limit:
+                        break
+                    try:
+                        z = self._get(obj, self.keys.atom_types)
+                    except Exception:
+                        continue
+                    zt = torch.as_tensor(z)
+                    if zt.dtype.is_floating_point:
+                        zt = zt.round().to(torch.long)
+                    else:
+                        zt = zt.to(torch.long)
+                    inferred_atomic_numbers.update(int(x) for x in torch.unique(zt).tolist())
+                    scanned_mols += 1
+
+            self._cum_counts.append(self._cum_counts[-1] + n_items)
+
+        # Cache of loaded bundles to avoid repeated unpickling when many samples come from the same file.
+        # This is per-process (DataLoader worker) and gets cleared on pickling.
+        self._bundle_cache: "OrderedDict[str, Tuple[list[Any], list[str]]]" = OrderedDict()
+
         self.atomic_number_to_index: Optional[dict[int, int]] = None
         if self.atom_types_format == "atomic_numbers":
             if self.allowed_atomic_numbers is None:
-                self.allowed_atomic_numbers = self._infer_allowed_atomic_numbers(limit=self.scan_limit)
+                if inferred_atomic_numbers is None or len(inferred_atomic_numbers) == 0:
+                    raise ValueError("Could not infer any atomic numbers during scan")
+                self.allowed_atomic_numbers = sorted(inferred_atomic_numbers)
             self.allowed_atomic_numbers = sorted(set(int(z) for z in self.allowed_atomic_numbers))
             self.atomic_number_to_index = {int(z): i for i, z in enumerate(self.allowed_atomic_numbers)}
             # Override num_atom_types if not provided
@@ -88,28 +129,29 @@ class PKLEnergyForceDataset(Dataset):
                 )
 
     def __len__(self) -> int:
-        return len(self.file_paths)
+        return int(self._cum_counts[-1])
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        fp = self.file_paths[idx]
-        with open(fp, "rb") as f:
-            data = pickle.load(f)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
 
-        # tolerate dict-like or attribute-like access
-        def _get(obj, k):
-            if isinstance(obj, dict):
-                return obj[k]
-            return getattr(obj, k)
+        file_i = bisect.bisect_right(self._cum_counts, idx) - 1
+        inner_i = int(idx - self._cum_counts[file_i])
+        fp = self.file_paths[file_i]
 
-        pos = _get(data, self.keys.pos)
-        atom_types = _get(data, self.keys.atom_types)
-        energy = _get(data, self.keys.energy)
-        forces = _get(data, self.keys.forces)
+        items, names = self._get_bundle_items_cached(fp)
+        data = items[inner_i]
+        name = names[inner_i] if inner_i < len(names) else f"{fp.name}:{inner_i}"
+
+        pos = self._get(data, self.keys.pos)
+        atom_types = self._get(data, self.keys.atom_types)
+        energy = self._get(data, self.keys.energy)
+        forces = self._get(data, self.keys.forces)
 
         # Optional sanity check if natoms is present
         natoms = None
         try:
-            natoms = _get(data, "natoms")
+            natoms = self._get(data, "natoms")
         except Exception:
             natoms = None
 
@@ -184,7 +226,7 @@ class PKLEnergyForceDataset(Dataset):
             )
 
         ligand = {
-            "name": fp.name,
+            "name": name,
             "x": pos,
             "one_hot": one_hot,
             "size": pos.size(0),
@@ -192,7 +234,7 @@ class PKLEnergyForceDataset(Dataset):
 
         # Keep a stable schema with an empty pocket (ligand-only training for now)
         pocket = {
-            "name": fp.name,
+            "name": name,
             "x": torch.zeros((0, 3), dtype=pos.dtype, device=pos.device),
             "one_hot": torch.zeros((0, 0), dtype=one_hot.dtype, device=one_hot.device),
             "size": 0,
@@ -205,35 +247,60 @@ class PKLEnergyForceDataset(Dataset):
             "force": forces,
         }
 
-    def _infer_allowed_atomic_numbers(self, *, limit: int) -> List[int]:
-        """Scan the first N files and infer unique atomic numbers.
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        # Avoid pickling large cached bundles when DataLoader forks workers.
+        state["_bundle_cache"] = OrderedDict()
+        return state
 
-        Keeps this intentionally lightweight; for huge datasets you should preferably
-        pass allowed_atomic_numbers explicitly via config.
-        """
-        uniq: set[int] = set()
-        n = min(len(self.file_paths), max(1, int(limit)))
+    @staticmethod
+    def _get(obj: Any, k: str):
+        """Tolerate dict-like or attribute-like access."""
+        if isinstance(obj, dict):
+            return obj[k]
+        return getattr(obj, k)
 
-        for fp in self.file_paths[:n]:
-            with open(fp, "rb") as f:
-                data = pickle.load(f)
+    def _load_as_items(self, fp: Path) -> Tuple[list[Any], list[str]]:
+        """Load a pkl file and normalize into a list of per-molecule objects + names."""
+        with open(fp, "rb") as f:
+            obj = pickle.load(f)
 
-            def _get(obj, k):
-                if isinstance(obj, dict):
-                    return obj[k]
-                return getattr(obj, k)
+        # Case 1: bundled dict with explicit items
+        if isinstance(obj, dict) and "items" in obj and isinstance(obj["items"], (list, tuple)):
+            items = list(obj["items"])
+            names = obj.get("names")
+            if isinstance(names, (list, tuple)) and len(names) == len(items):
+                return items, [str(n) for n in names]
+            return items, [f"{fp.name}:{i}" for i in range(len(items))]
 
-            z = _get(data, self.keys.atom_types)
-            z = torch.as_tensor(z)
-            if z.dtype.is_floating_point:
-                z = z.round().to(torch.long)
-            else:
-                z = z.to(torch.long)
-            uniq.update(int(x) for x in torch.unique(z).tolist())
+        # Case 2: plain list/tuple (treated as a list of per-molecule records)
+        if isinstance(obj, (list, tuple)):
+            items = list(obj)
+            return items, [f"{fp.name}:{i}" for i in range(len(items))]
 
-        if len(uniq) == 0:
-            raise ValueError("Could not infer any atomic numbers during scan")
-        return sorted(uniq)
+        # Case 3: single-molecule pkl
+        return [obj], [fp.name]
+
+    def _get_bundle_items_cached(self, fp: Path) -> Tuple[list[Any], list[str]]:
+        key = str(fp)
+        hit = self._bundle_cache.get(key)
+        if hit is not None:
+            self._bundle_cache.move_to_end(key)
+            return hit
+
+        items, names = self._load_as_items(fp)
+        self._bundle_cache[key] = (items, names)
+        self._bundle_cache.move_to_end(key)
+
+        # Enforce a small LRU cache
+        max_size = max(0, int(self.bundle_cache_size))
+        if max_size == 0:
+            self._bundle_cache.clear()
+        else:
+            while len(self._bundle_cache) > max_size:
+                self._bundle_cache.popitem(last=False)
+
+        return items, names
 
     @staticmethod
     def collate_fn(batch_items: List[Dict[str, Any]]):
