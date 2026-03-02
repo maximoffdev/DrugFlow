@@ -905,12 +905,15 @@ class EnergyForceDiffusion(pl.LightningModule):
                 # points, depending on `hjb_eval_points`. In particular, if
                 # hjb_eval_points=='uniform', we do NOT compute HJB on the diffused samples.
 
-                force_pred = pred_ligand.get("force", pred_ligand.get("v", None))
-                if force_pred is None:
-                    raise KeyError("Dynamics must return 'force' (preferred) or legacy 'v'")
+                # Use the background force for HJB/consistency: F_bg = F_fm + F_corr.
+                force_fm = pred_ligand.get("force_fm", pred_ligand.get("force", pred_ligand.get("v", None)))
+                force_corr = pred_ligand.get("force_corr", None)
+                if force_fm is None:
+                    raise KeyError("Dynamics must return 'force_fm' or ('force'/'v')")
+                force_bg = force_fm if force_corr is None else (force_fm + force_corr)
 
                 loss_hjb, loss_consistency = self.module_x.hjb_loss(
-                    force_pred.to(dtype=ligand["x"].dtype),
+                    force_bg.to(dtype=ligand["x"].dtype),
                     pred_ligand["energy"].to(dtype=ligand["x"].dtype).view(-1),
                     zt_x,
                     t_used,
@@ -964,9 +967,12 @@ class EnergyForceDiffusion(pl.LightningModule):
 
                 if need_force_t0:
                     assert force is not None
-                    force_pred = pred_ligand.get("force", pred_ligand.get("v", None))
-                    if force_pred is None:
-                        raise RuntimeError("Internal error: force boundary requested but force_pred is missing")
+                    # Force boundary uses background force: F_bg = F_fm + F_corr.
+                    force_fm = pred_ligand.get("force_fm", pred_ligand.get("force", pred_ligand.get("v", None)))
+                    force_corr = pred_ligand.get("force_corr", None)
+                    if force_fm is None:
+                        raise RuntimeError("Internal error: force boundary requested but force output is missing")
+                    force_pred = force_fm if force_corr is None else (force_fm + force_corr)
                     force_tgt = force.to(device=ligand["x"].device, dtype=ligand["x"].dtype)
                     if force_tgt.shape != force_pred.shape:
                         raise ValueError(
@@ -1011,9 +1017,10 @@ class EnergyForceDiffusion(pl.LightningModule):
             d_sigma_dt = -sigma_tau * log_ratio
             v_target = d_sigma_dt[ligand["mask"]] * eps_x
 
-            force_pred = pred_ligand.get("force", pred_ligand.get("v", None))
+            # Flow-matching loss uses the dedicated FM force head if available.
+            force_pred = pred_ligand.get("force_fm", pred_ligand.get("force", pred_ligand.get("v", None)))
             if force_pred is None:
-                raise KeyError("Dynamics must return 'force' (preferred) or legacy 'v'")
+                raise KeyError("Dynamics must return 'force_fm' or ('force'/'v')")
 
             # Velocity for flow-matching loss is computed directly from predicted force:
             #   v = f + 0.5 * g^2 * F

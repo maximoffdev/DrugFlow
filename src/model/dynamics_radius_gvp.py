@@ -129,6 +129,21 @@ class RadiusGVPDynamics(nn.Module):
             nn.Linear(params.hidden_scalar_nf, 1),
         )
 
+        # Force heads: decode two force components from the GVP backbone output.
+        # We treat the backbone's vector output `v` as an intermediate representation
+        # and predict two force vectors (F_fm, F_corr) whose sum is the total force.
+        force_in_dim = params.hidden_scalar_nf + self.x_dim + self.x_dim  # [h_final, x, v]
+        self.force_fm_head = nn.Sequential(
+            nn.Linear(force_in_dim, params.hidden_scalar_nf),
+            nn.SiLU(),
+            nn.Linear(params.hidden_scalar_nf, self.x_dim),
+        )
+        self.force_corr_head = nn.Sequential(
+            nn.Linear(force_in_dim, params.hidden_scalar_nf),
+            nn.SiLU(),
+            nn.Linear(params.hidden_scalar_nf, self.x_dim),
+        )
+
     def _build_edges(self, x: torch.Tensor, batch_mask: torch.Tensor) -> torch.Tensor:
         # biKNN hard radius graph (matches FairChem/OMol-style selection logic).
         # If no cutoff is provided, treat as effectively infinite.
@@ -196,10 +211,17 @@ class RadiusGVPDynamics(nn.Module):
         energy_node = self.energy_node_head(ef_feats).squeeze(-1)
         energy = scatter_mean(energy_node, mask_atoms, dim=0)
 
+        force_feats = torch.cat([h_final, x_atoms.to(h_final.dtype), v.to(h_final.dtype)], dim=-1)
+        force_fm = self.force_fm_head(force_feats)
+        force_corr = self.force_corr_head(force_feats)
+        force = force_fm + force_corr
+
         pred_ligand = {
             "logits_h": logits_h,
             "energy": energy,
-            "force": v,
+            "force": force,
+            "force_fm": force_fm,
+            "force_corr": force_corr,
         }
         pred_residues = {}
         return pred_ligand, pred_residues
