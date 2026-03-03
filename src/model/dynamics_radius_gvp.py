@@ -45,6 +45,10 @@ class RadiusGVPParams:
     d_max: float = 15.0
     num_rbf: int = 16
 
+    # Force head scaling
+    force_fm_scale: float = 1.0
+    force_corr_scale: float = 1.0
+
 
 class RadiusGVPDynamics(nn.Module):
     """Ligand-only radius-graph dynamics using the same GVP backbone as DrugFlow.
@@ -212,8 +216,8 @@ class RadiusGVPDynamics(nn.Module):
         energy = scatter_mean(energy_node, mask_atoms, dim=0)
 
         force_feats = torch.cat([h_final, x_atoms.to(h_final.dtype), v.to(h_final.dtype)], dim=-1)
-        force_fm = self.force_fm_head(force_feats)
-        force_corr = self.force_corr_head(force_feats)
+        force_fm = self.force_fm_head(force_feats) * float(getattr(self.params, "force_fm_scale", 1.0))
+        force_corr = self.force_corr_head(force_feats) * float(getattr(self.params, "force_corr_scale", 1.0))
         force = force_fm + force_corr
 
         pred_ligand = {

@@ -130,6 +130,10 @@ predictor_params:
   backbone: gvp
   condition_time: True
   condition_temperature: False  # ignored; temperature conditioning follows simulation_params.use_temperature
+
+  # Scale the two force heads (set to 0.0 to disable one component).
+  force_fm_scale: 1.0
+  force_corr_scale: 1.0
   
   # Radius graph construction (ligand-only)
   edge_cutoff_ligand: 50.0

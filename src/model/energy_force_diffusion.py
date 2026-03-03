@@ -298,6 +298,9 @@ class EnergyForceDiffusion(pl.LightningModule):
 
         backbone = getattr(predictor_params, "backbone", "radius_mlp")
         if backbone == "gvp":
+            # Optional scaling for the two force heads (allows turning one off with 0.0).
+            set_default(predictor_params, "force_fm_scale", 1.0)
+            set_default(predictor_params, "force_corr_scale", 1.0)
             gvp_params = getattr(predictor_params, "gvp_params", Namespace())
             params = RadiusGVPParams(
                 hidden_scalar_nf=int(getattr(predictor_params, "hidden_nf", 128)),
@@ -315,6 +318,8 @@ class EnergyForceDiffusion(pl.LightningModule):
                 reflection_equivariant=bool(getattr(predictor_params, "reflection_equivariant", False)),
                 d_max=float(getattr(predictor_params, "d_max", 15.0)),
                 num_rbf=int(getattr(predictor_params, "num_rbf", 16)),
+                force_fm_scale=float(getattr(predictor_params, "force_fm_scale", 1.0)),
+                force_corr_scale=float(getattr(predictor_params, "force_corr_scale", 1.0)),
             )
             self.dynamics = RadiusGVPDynamics(atom_nf=self.atom_nf, x_dim=self.x_dim, params=params)
             self.condition_time = bool(getattr(predictor_params, "condition_time", True))
