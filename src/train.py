@@ -130,6 +130,12 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument('--config', type=str, required=True)
     p.add_argument('--dataset_stats', type=str, default=None, help='Path to dataset stats YAML (sigma + omol_elem_refs)')
+    p.add_argument(
+        '--data_dir',
+        type=str,
+        default=None,
+        help='Override train_params.datadir from the config YAML (e.g., set dataset path at runtime)',
+    )
     p.add_argument('--resume', type=str, default=None)
     p.add_argument('--backoff', action='store_true')
     p.add_argument('--finetune', action='store_true')
@@ -178,6 +184,16 @@ if __name__ == "__main__":
             stats = yaml.safe_load(f)
         config.setdefault('train_params', {})
         config['train_params']['dataset_stats'] = stats
+
+    # Optional: override dataset location from CLI.
+    # This is intentionally applied after resume-config merging so the user can
+    # relocate datasets without editing the original run config.
+    if args.data_dir is not None:
+        config.setdefault('train_params', {})
+        prev = config['train_params'].get('datadir', None)
+        if prev != args.data_dir:
+            print(f'[CONFIG UPDATE] train_params.datadir: {prev} -> {args.data_dir}', flush=True)
+        config['train_params']['datadir'] = args.data_dir
 
     args = merge_args_and_yaml(args, config)
 
