@@ -910,12 +910,68 @@ class EnergyForceDiffusion(pl.LightningModule):
                 # points, depending on `hjb_eval_points`. In particular, if
                 # hjb_eval_points=='uniform', we do NOT compute HJB on the diffused samples.
 
-                # Use the background force for HJB/consistency: F_bg = F_fm + F_corr.
-                force_fm = pred_ligand.get("force_fm", pred_ligand.get("force", pred_ligand.get("v", None)))
+                # Use the background force for HJB/consistency:
+                #   F_bg(x,t) = F_corr,pred(x,t) + F_fm,target(x,t)
+                # where F_fm,target is derived from the flow-matching target velocity v_true
+                # and converted into a force using the ODE relationship:
+                #   v = f + 0.5 * g^2 * F  =>  F = 2 (v - f) / g^2.
+                #
+                # IMPORTANT: to get a non-trivial divergence contribution from the target term,
+                # construct v_true as an explicit function of x_t (=zt_x) rather than using the
+                # sampled eps_x (which is typically treated as constant w.r.t. x_t).
+
                 force_corr = pred_ligand.get("force_corr", None)
-                if force_fm is None:
-                    raise KeyError("Dynamics must return 'force_fm' or ('force'/'v')")
-                force_bg = force_fm if force_corr is None else (force_fm + force_corr)
+                if force_corr is None:
+                    force_corr = torch.zeros_like(zt_x)
+                else:
+                    force_corr = force_corr.to(dtype=zt_x.dtype)
+
+                # Diffusion forward-time tau: 0 clean -> 1 noisy.
+                tau_hjb = 1.0 - t_used
+
+                # Compute epsilon as a function of x_t and x0 so v_true is differentiable w.r.t. x_t.
+                a_tau = self.module_x.alpha(tau_hjb, temperature=temperature)  # (B,1)
+                sigma_tau = self.module_x.sigma(tau_hjb, temperature=temperature)  # (B,1)
+                a_node = a_tau[ligand["mask"]]
+                sigma_node = torch.clamp(sigma_tau[ligand["mask"]], min=1e-12)
+                eps_from_xt = (zt_x - a_node * ligand["x"]) / sigma_node
+
+                # Flow-time derivatives d/dt (flow-time t=0 noisy -> 1 clean).
+                # We use tau = 1 - t, so d/dt = -d/dtau.
+                if self.module_x.sde.kind == "ve":
+                    log_ratio = float(np.log(float(self.module_x.sde.sigma_max) / float(self.module_x.sde.sigma_min)))
+                    d_alpha_dt = torch.zeros_like(a_tau)
+                    d_sigma_dt = -sigma_tau * log_ratio
+                elif self.module_x.sde.kind == "vp":
+                    beta0 = float(self.module_x.sde.beta_min)
+                    beta1 = float(self.module_x.sde.beta_max)
+                    beta = beta0 + (beta1 - beta0) * tau_hjb
+                    if isinstance(temperature, torch.Tensor):
+                        beta = beta * torch.clamp(temperature.to(device=beta.device, dtype=beta.dtype), min=1e-6)
+
+                    # alpha(tau) = exp(-0.5 * int_0^tau beta(s) ds) => d alpha/d tau = -0.5 * beta(tau) * alpha.
+                    # d alpha/d t(flow) = - d alpha/d tau.
+                    d_alpha_dt = 0.5 * beta * a_tau
+
+                    # sigma(tau) = vp_sigma_scale * sqrt(1 - alpha(tau)^2).
+                    # d sigma/d tau = 0.5 * beta(tau) * vp_sigma_scale^2 * alpha(tau)^2 / sigma(tau)
+                    # d sigma/d t(flow) = - d sigma/d tau.
+                    vp_scale = float(self.module_x.sde.vp_sigma_scale)
+                    sigma_tau_clamped = torch.clamp(sigma_tau, min=1e-12)
+                    d_sigma_dt = -0.5 * beta * (vp_scale * vp_scale) * (a_tau * a_tau) / sigma_tau_clamped
+                else:
+                    raise ValueError(f"Unknown SDE kind: {self.module_x.sde.kind}")
+
+                v_true = d_alpha_dt[ligand["mask"]] * ligand["x"] + d_sigma_dt[ligand["mask"]] * eps_from_xt
+
+                # Convert target velocity into a target force via the forward SDE coefficients.
+                f_node = self.module_x._sde_f_forward(zt_x, tau_hjb, ligand["mask"], temperature=temperature).to(dtype=zt_x.dtype)
+                g2 = self.module_x._sde_g2_forward(tau_hjb, temperature=temperature)  # (B,)
+                g2_node = torch.clamp(g2[ligand["mask"]].unsqueeze(-1), min=1e-12).to(dtype=zt_x.dtype)
+                force_fm_target = 2.0 * (v_true.to(dtype=zt_x.dtype) - f_node) / g2_node
+
+                # Final background force used inside HJB/consistency.
+                force_bg = force_corr + force_fm_target
 
                 loss_hjb, loss_consistency = self.module_x.hjb_loss(
                     force_bg.to(dtype=ligand["x"].dtype),
