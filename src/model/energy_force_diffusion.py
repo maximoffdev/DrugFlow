@@ -320,6 +320,7 @@ class EnergyForceDiffusion(pl.LightningModule):
                 num_rbf=int(getattr(predictor_params, "num_rbf", 16)),
                 force_fm_scale=float(getattr(predictor_params, "force_fm_scale", 1.0)),
                 force_corr_scale=float(getattr(predictor_params, "force_corr_scale", 1.0)),
+                force_corr_schedule=bool(getattr(predictor_params, "force_corr_schedule", False)),
             )
             self.dynamics = RadiusGVPDynamics(atom_nf=self.atom_nf, x_dim=self.x_dim, params=params)
             self.condition_time = bool(getattr(predictor_params, "condition_time", True))
@@ -906,6 +907,8 @@ class EnergyForceDiffusion(pl.LightningModule):
             # Lightning wraps validation/test in torch.no_grad(). Autograd-based HJB terms
             # must run under torch.enable_grad() to build the necessary graphs.
             with grad_ctx:
+                target_s = float(getattr(self, "target_sigma", 1.0))
+                
                 # Continuity (HJB) is computed either on the noisy samples OR on uniform
                 # points, depending on `hjb_eval_points`. In particular, if
                 # hjb_eval_points=='uniform', we do NOT compute HJB on the diffused samples.
@@ -922,9 +925,10 @@ class EnergyForceDiffusion(pl.LightningModule):
 
                 force_corr = pred_ligand.get("force_corr", None)
                 if force_corr is None:
-                    force_corr = torch.zeros_like(zt_x)
+                    force_corr_phys = torch.zeros_like(zt_x)
                 else:
-                    force_corr = force_corr.to(dtype=zt_x.dtype)
+                    # Unscale model output to physical units
+                    force_corr_phys = force_corr.to(dtype=zt_x.dtype) * target_s
 
                 # Diffusion forward-time tau: 0 clean -> 1 noisy.
                 tau_hjb = 1.0 - t_used
@@ -968,14 +972,19 @@ class EnergyForceDiffusion(pl.LightningModule):
                 f_node = self.module_x._sde_f_forward(zt_x, tau_hjb, ligand["mask"], temperature=temperature).to(dtype=zt_x.dtype)
                 g2 = self.module_x._sde_g2_forward(tau_hjb, temperature=temperature)  # (B,)
                 g2_node = torch.clamp(g2[ligand["mask"]].unsqueeze(-1), min=1e-12).to(dtype=zt_x.dtype)
+                
+                # force_fm_target is derived from raw geometric coords so it naturally sits in physical units.
                 force_fm_target = 2.0 * (v_true.to(dtype=zt_x.dtype) - f_node) / g2_node
 
-                # Final background force used inside HJB/consistency.
-                force_bg = force_corr + force_fm_target
+                # Final background force used inside HJB/consistency (fully in physical units)
+                force_bg_phys = force_corr_phys + force_fm_target
+
+                u_pred_phys = pred_ligand["energy"].to(dtype=ligand["x"].dtype).view(-1) * target_s
+                du_dx_phys = du_dx_shared * target_s if du_dx_shared is not None else None
 
                 loss_hjb, loss_consistency = self.module_x.hjb_loss(
-                    force_bg.to(dtype=ligand["x"].dtype),
-                    pred_ligand["energy"].to(dtype=ligand["x"].dtype).view(-1),
+                    force_bg_phys.to(dtype=ligand["x"].dtype),
+                    u_pred_phys,
                     zt_x,
                     t_used,
                     ligand["mask"],
@@ -988,7 +997,7 @@ class EnergyForceDiffusion(pl.LightningModule):
                     trace_batch_size=trace_batch_size,
                     compute_hjb=(float(self.lambda_hjb) > 0.0),
                     compute_consistency=(float(self.lambda_consistency) > 0.0),
-                    du_dx=du_dx_shared,
+                    du_dx=du_dx_phys,
                     debug=hjb_debug,
                 )
 
@@ -1083,6 +1092,10 @@ class EnergyForceDiffusion(pl.LightningModule):
             if force_pred is None:
                 raise KeyError("Dynamics must return 'force_fm' or ('force'/'v')")
 
+            # Unscale the network's force prediction to physical units before SDE math
+            target_s = float(getattr(self, "target_sigma", 1.0))
+            force_pred_phys = force_pred.to(dtype=ligand["x"].dtype) * target_s
+
             # Velocity for flow-matching loss is computed directly from predicted force:
             #   v = f + 0.5 * g^2 * F
             tau_used = 1.0 - t_used
@@ -1094,7 +1107,7 @@ class EnergyForceDiffusion(pl.LightningModule):
             )
             g2 = self.module_x._sde_g2_forward(tau_used, temperature=temperature)  # (B,)
             g2_node = g2[ligand["mask"]].unsqueeze(-1)
-            v_pred = f + 0.5 * g2_node * force_pred.to(dtype=ligand["x"].dtype)
+            v_pred = f + 0.5 * g2_node * force_pred_phys
 
             per_node = torch.sum((v_pred - v_target) ** 2, dim=-1)
 
@@ -1469,8 +1482,11 @@ class EnergyForceDiffusion(pl.LightningModule):
             F = pred_ligand.get("force", pred_ligand.get("v", None))
             if F is None:
                 raise KeyError("Dynamics must return 'force' (preferred) or legacy 'v'")
-            # Model is trained in scaled units; undo scaling for diffusion integration.
-            F = F * float(getattr(self, "target_sigma", 1.0))
+            
+            # Model is trained in scaled units; undo scaling for diffusion integration to physical space.
+            target_s = float(getattr(self, "target_sigma", 1.0))
+            F = F * target_s
+
             s_tau = 1.0 - s
             f = self.module_x._sde_f_forward(x, s_tau, batch_mask, temperature=sampler_temperature).to(dtype=x.dtype)
             g2 = self.module_x._sde_g2_forward(s_tau, temperature=sampler_temperature)  # (B,)

@@ -48,6 +48,7 @@ class RadiusGVPParams:
     # Force head scaling
     force_fm_scale: float = 1.0
     force_corr_scale: float = 1.0
+    force_corr_schedule: bool = False
 
 
 class RadiusGVPDynamics(nn.Module):
@@ -218,14 +219,24 @@ class RadiusGVPDynamics(nn.Module):
         force_feats = torch.cat([h_final, x_atoms.to(h_final.dtype), v.to(h_final.dtype)], dim=-1)
         force_fm = self.force_fm_head(force_feats) * float(getattr(self.params, "force_fm_scale", 1.0))
         force_corr = self.force_corr_head(force_feats) * float(getattr(self.params, "force_corr_scale", 1.0))
-        force = force_fm + force_corr
+        
+        # Optionally apply schedule: F_final_corr = force_corr * t
+        final_force_corr = force_corr
+        if getattr(self.params, "force_corr_schedule", False):
+            if t is None:
+                raise ValueError("t is required when force_corr_schedule=True")
+            # t shape is usually (B,1), stretch to (N,1)
+            t_node = t.to(device=h.device, dtype=h.dtype).view(1, 1).expand(h.size(0), 1) if t.numel() == 1 else t[mask_atoms].to(h.dtype)
+            final_force_corr = force_corr * t_node
+
+        force = force_fm + final_force_corr
 
         pred_ligand = {
             "logits_h": logits_h,
             "energy": energy,
             "force": force,
             "force_fm": force_fm,
-            "force_corr": force_corr,
+            "force_corr": final_force_corr,
         }
         pred_residues = {}
         return pred_ligand, pred_residues

@@ -135,6 +135,9 @@ predictor_params:
   force_fm_scale: 1.0
   force_corr_scale: 1.0
   
+  # Fades in F_corr over flow time t: F = F_FM + t * F_corr
+  force_corr_schedule: True
+  
   # Radius graph construction (ligand-only)
   edge_cutoff_ligand: 50.0
   knn_k: 50
