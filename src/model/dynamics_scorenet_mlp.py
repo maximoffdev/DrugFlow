@@ -19,6 +19,11 @@ class ScoreNetMLPParams:
     condition_time: bool = True
     condition_temperature: bool = False
 
+    # Force head scaling / scheduling (match GVP dynamics contract)
+    force_fm_scale: float = 1.0
+    force_corr_scale: float = 1.0
+    force_corr_schedule: bool = False
+
 
 class SinusoidalTimeEmbeddings(nn.Module):
     """Creates a high-dimensional vector representation of scalar time t."""
@@ -67,7 +72,7 @@ class TimeAwareResBlock(nn.Module):
 
 
 class ScoreNet(nn.Module):
-    """Time-conditioned MLP predicting velocity v(x,t) and energy u(x,t)."""
+    """Time-conditioned MLP trunk producing hidden features h(x,t)."""
 
     def __init__(self, input_dim: int = 2, hidden_dim: int = 128, time_emb_dim: int = 64, num_layers: int = 3):
         super().__init__()
@@ -84,10 +89,7 @@ class ScoreNet(nn.Module):
         self.final_norm = nn.LayerNorm(hidden_dim)
         self.final_act = nn.SiLU()
 
-        self.head_force = nn.Linear(hidden_dim, 2)
-        self.head_energy = nn.Linear(hidden_dim, 1)
-
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         if t.dim() == 1:
             t = t.unsqueeze(-1)
 
@@ -96,10 +98,7 @@ class ScoreNet(nn.Module):
         for block in self.blocks:
             h = block(h, t_emb)
         h = self.final_act(self.final_norm(h))
-
-        force = self.head_force(h)
-        energy = self.head_energy(h)
-        return force, energy
+        return h
 
 
 class ScoreNetMLPDynamics(nn.Module):
@@ -108,7 +107,10 @@ class ScoreNetMLPDynamics(nn.Module):
         Matches the dynamics forward signature and returns pred_ligand with keys:
             - logits_h: (N, atom_nf)
             - energy: (B,)
-            - v: (N, 3)  (velocity)
+            - force: (N, x_dim)
+            - force_fm: (N, x_dim)
+            - force_corr: (N, x_dim)
+            - v: (N, x_dim) legacy alias for `force`
 
     Notes:
       - For swiss-roll notebook we only use x/y; z is ignored and force_z is zero.
@@ -135,14 +137,9 @@ class ScoreNetMLPDynamics(nn.Module):
 
         # Optional atom-type logits head (kept for compatibility with diffuse_h=True paths).
         self.logits_h_head = nn.Linear(int(self.params.hidden_dim), self.atom_nf)
-
-        # Helper to reuse the backbone's input embedding when producing logits.
-        # We keep it minimal and consistent: x->input_proj->blocks->final->h.
-        self._input_proj = self.net.input_proj
-        self._time_mlp = self.net.time_mlp
-        self._blocks = self.net.blocks
-        self._final_norm = self.net.final_norm
-        self._final_act = self.net.final_act
+        self.energy_head = nn.Linear(int(self.params.hidden_dim), 1)
+        self.force_fm_head = nn.Linear(int(self.params.hidden_dim), 2)
+        self.force_corr_head = nn.Linear(int(self.params.hidden_dim), 2)
 
     def _t_to_node(self, t: torch.Tensor, mask_atoms: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
         if t.ndim == 1:
@@ -175,30 +172,40 @@ class ScoreNetMLPDynamics(nn.Module):
         # Time per node (N,1), preserve autograd
         t_node = self._t_to_node(t, mask_atoms, dtype=x2.dtype)
 
-        # Forward through ScoreNet
-        v2, energy_node_1 = self.net(x2, t_node)
+        # Forward through ScoreNet trunk
+        h = self.net(x2, t_node)
 
-        # Pad velocity to (N,3) for the diffusion module, keep dtype consistent with x_atoms
-        v = torch.zeros((x_atoms.size(0), self.x_dim), device=x_atoms.device, dtype=x_atoms.dtype)
-        v[:, 0:2] = v2.to(dtype=x_atoms.dtype)
+        force_fm2 = self.force_fm_head(h) * float(getattr(self.params, "force_fm_scale", 1.0))
+        force_corr2 = self.force_corr_head(h) * float(getattr(self.params, "force_corr_scale", 1.0))
+
+        final_force_corr2 = force_corr2
+        if bool(getattr(self.params, "force_corr_schedule", False)):
+            final_force_corr2 = force_corr2 * t_node.to(dtype=force_corr2.dtype)
+
+        force2 = force_fm2 + final_force_corr2
+
+        # Pad forces to (N, x_dim) for the diffusion module, keep dtype consistent with x_atoms.
+        force = torch.zeros((x_atoms.size(0), self.x_dim), device=x_atoms.device, dtype=x_atoms.dtype)
+        force_fm = torch.zeros_like(force)
+        force_corr = torch.zeros_like(force)
+        force[:, 0:2] = force2.to(dtype=x_atoms.dtype)
+        force_fm[:, 0:2] = force_fm2.to(dtype=x_atoms.dtype)
+        force_corr[:, 0:2] = final_force_corr2.to(dtype=x_atoms.dtype)
 
         # Pool node energies -> per-graph energy (B,)
-        energy_node = energy_node_1.squeeze(-1).to(dtype=x_atoms.dtype)
+        energy_node = self.energy_head(h).squeeze(-1).to(dtype=x_atoms.dtype)
         energy = scatter_mean(energy_node, mask_atoms, dim=0)
 
-        # Build a hidden representation for logits_h by re-running the trunk (cheap vs adding hooks)
-        # This keeps logits_h defined even if diffuse_h is enabled.
-        t_emb = self._time_mlp(t_node)
-        h = self._input_proj(x2)
-        for block in self._blocks:
-            h = block(h, t_emb)
-        h = self._final_act(self._final_norm(h))
         logits_h = self.logits_h_head(h)
 
         pred_ligand = {
             "logits_h": logits_h,
             "energy": energy,
-            "v": v,
+            "force": force,
+            "force_fm": force_fm,
+            "force_corr": force_corr,
+            # Backward-compatible alias; callers now prefer `force` explicitly.
+            "v": force,
         }
         pred_residues = {}
         return pred_ligand, pred_residues

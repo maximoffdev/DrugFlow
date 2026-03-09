@@ -349,6 +349,10 @@ class EnergyForceDiffusion(pl.LightningModule):
             # Keep temperature conditioning controlled by simulation_params.use_temperature.
             condition_temperature = bool(self.use_temperature)
 
+            set_default(predictor_params, "force_fm_scale", float(getattr(scorenet_mlp, "force_fm_scale", 1.0)))
+            set_default(predictor_params, "force_corr_scale", float(getattr(scorenet_mlp, "force_corr_scale", 1.0)))
+            set_default(predictor_params, "force_corr_schedule", bool(getattr(scorenet_mlp, "force_corr_schedule", False)))
+
             params = ScoreNetMLPParams(
                 input_dim=2,
                 hidden_dim=hidden_dim,
@@ -356,6 +360,9 @@ class EnergyForceDiffusion(pl.LightningModule):
                 num_layers=num_layers,
                 condition_time=condition_time,
                 condition_temperature=condition_temperature,
+                force_fm_scale=float(getattr(predictor_params, "force_fm_scale", 1.0)),
+                force_corr_scale=float(getattr(predictor_params, "force_corr_scale", 1.0)),
+                force_corr_schedule=bool(getattr(predictor_params, "force_corr_schedule", False)),
             )
             self.dynamics = ScoreNetMLPDynamics(atom_nf=self.atom_nf, x_dim=self.x_dim, params=params)
             self.condition_time = bool(condition_time)
