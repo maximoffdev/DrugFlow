@@ -907,7 +907,7 @@ class EnergyForceDiffusion(pl.LightningModule):
             # Lightning wraps validation/test in torch.no_grad(). Autograd-based HJB terms
             # must run under torch.enable_grad() to build the necessary graphs.
             with grad_ctx:
-                target_s = float(getattr(self, "target_sigma", 1.0))
+                # target_s = float(getattr(self, "target_sigma", 1.0))
                 
                 # Continuity (HJB) is computed either on the noisy samples OR on uniform
                 # points, depending on `hjb_eval_points`. In particular, if
@@ -924,67 +924,71 @@ class EnergyForceDiffusion(pl.LightningModule):
                 # sampled eps_x (which is typically treated as constant w.r.t. x_t).
 
                 force_corr = pred_ligand.get("force_corr", None)
+                force_fm = pred_ligand.get("force_fm", None)
                 if force_corr is None:
-                    force_corr_phys = torch.zeros_like(zt_x)
-                else:
-                    # Unscale model output to physical units
-                    force_corr_phys = force_corr.to(dtype=zt_x.dtype) * target_s
+                    force_corr = torch.zeros_like(zt_x)
+                # else:
+                #     # Unscale model output to physical units
+                #     force_corr = force_corr.to(dtype=zt_x.dtype) * target_s
+                if force_fm is None:
+                    force_fm = torch.zeros_like(zt_x)
 
-                # Diffusion forward-time tau: 0 clean -> 1 noisy.
-                tau_hjb = 1.0 - t_used
+                # # Diffusion forward-time tau: 0 clean -> 1 noisy.
+                # tau_hjb = 1.0 - t_used
 
-                # Compute epsilon as a function of x_t and x0 so v_true is differentiable w.r.t. x_t.
-                a_tau = self.module_x.alpha(tau_hjb, temperature=temperature)  # (B,1)
-                sigma_tau = self.module_x.sigma(tau_hjb, temperature=temperature)  # (B,1)
-                a_node = a_tau[ligand["mask"]]
-                sigma_node = torch.clamp(sigma_tau[ligand["mask"]], min=1e-12)
-                eps_from_xt = (zt_x - a_node * ligand["x"]) / sigma_node
+                # # Compute epsilon as a function of x_t and x0 so v_true is differentiable w.r.t. x_t.
+                # a_tau = self.module_x.alpha(tau_hjb, temperature=temperature)  # (B,1)
+                # sigma_tau = self.module_x.sigma(tau_hjb, temperature=temperature)  # (B,1)
+                # a_node = a_tau[ligand["mask"]]
+                # sigma_node = torch.clamp(sigma_tau[ligand["mask"]], min=1e-12)
+                # eps_from_xt = (zt_x - a_node * ligand["x"]) / sigma_node
 
-                # Flow-time derivatives d/dt (flow-time t=0 noisy -> 1 clean).
-                # We use tau = 1 - t, so d/dt = -d/dtau.
-                if self.module_x.sde.kind == "ve":
-                    log_ratio = float(np.log(float(self.module_x.sde.sigma_max) / float(self.module_x.sde.sigma_min)))
-                    d_alpha_dt = torch.zeros_like(a_tau)
-                    d_sigma_dt = -sigma_tau * log_ratio
-                elif self.module_x.sde.kind == "vp":
-                    beta0 = float(self.module_x.sde.beta_min)
-                    beta1 = float(self.module_x.sde.beta_max)
-                    beta = beta0 + (beta1 - beta0) * tau_hjb
-                    if isinstance(temperature, torch.Tensor):
-                        beta = beta * torch.clamp(temperature.to(device=beta.device, dtype=beta.dtype), min=1e-6)
+                # # Flow-time derivatives d/dt (flow-time t=0 noisy -> 1 clean).
+                # # We use tau = 1 - t, so d/dt = -d/dtau.
+                # if self.module_x.sde.kind == "ve":
+                #     log_ratio = float(np.log(float(self.module_x.sde.sigma_max) / float(self.module_x.sde.sigma_min)))
+                #     d_alpha_dt = torch.zeros_like(a_tau)
+                #     d_sigma_dt = -sigma_tau * log_ratio
+                # elif self.module_x.sde.kind == "vp":
+                #     beta0 = float(self.module_x.sde.beta_min)
+                #     beta1 = float(self.module_x.sde.beta_max)
+                #     beta = beta0 + (beta1 - beta0) * tau_hjb
+                #     if isinstance(temperature, torch.Tensor):
+                #         beta = beta * torch.clamp(temperature.to(device=beta.device, dtype=beta.dtype), min=1e-6)
 
-                    # alpha(tau) = exp(-0.5 * int_0^tau beta(s) ds) => d alpha/d tau = -0.5 * beta(tau) * alpha.
-                    # d alpha/d t(flow) = - d alpha/d tau.
-                    d_alpha_dt = 0.5 * beta * a_tau
+                #     # alpha(tau) = exp(-0.5 * int_0^tau beta(s) ds) => d alpha/d tau = -0.5 * beta(tau) * alpha.
+                #     # d alpha/d t(flow) = - d alpha/d tau.
+                #     d_alpha_dt = 0.5 * beta * a_tau
 
-                    # sigma(tau) = vp_sigma_scale * sqrt(1 - alpha(tau)^2).
-                    # d sigma/d tau = 0.5 * beta(tau) * vp_sigma_scale^2 * alpha(tau)^2 / sigma(tau)
-                    # d sigma/d t(flow) = - d sigma/d tau.
-                    vp_scale = float(self.module_x.sde.vp_sigma_scale)
-                    sigma_tau_clamped = torch.clamp(sigma_tau, min=1e-12)
-                    d_sigma_dt = -0.5 * beta * (vp_scale * vp_scale) * (a_tau * a_tau) / sigma_tau_clamped
-                else:
-                    raise ValueError(f"Unknown SDE kind: {self.module_x.sde.kind}")
+                #     # sigma(tau) = vp_sigma_scale * sqrt(1 - alpha(tau)^2).
+                #     # d sigma/d tau = 0.5 * beta(tau) * vp_sigma_scale^2 * alpha(tau)^2 / sigma(tau)
+                #     # d sigma/d t(flow) = - d sigma/d tau.
+                #     vp_scale = float(self.module_x.sde.vp_sigma_scale)
+                #     sigma_tau_clamped = torch.clamp(sigma_tau, min=1e-12)
+                #     d_sigma_dt = -0.5 * beta * (vp_scale * vp_scale) * (a_tau * a_tau) / sigma_tau_clamped
+                # else:
+                #     raise ValueError(f"Unknown SDE kind: {self.module_x.sde.kind}")
 
-                v_true = d_alpha_dt[ligand["mask"]] * ligand["x"] + d_sigma_dt[ligand["mask"]] * eps_from_xt
+                # v_true = d_alpha_dt[ligand["mask"]] * ligand["x"] + d_sigma_dt[ligand["mask"]] * eps_from_xt
 
-                # Convert target velocity into a target force via the forward SDE coefficients.
-                f_node = self.module_x._sde_f_forward(zt_x, tau_hjb, ligand["mask"], temperature=temperature).to(dtype=zt_x.dtype)
-                g2 = self.module_x._sde_g2_forward(tau_hjb, temperature=temperature)  # (B,)
-                g2_node = torch.clamp(g2[ligand["mask"]].unsqueeze(-1), min=1e-12).to(dtype=zt_x.dtype)
+                # # Convert target velocity into a target force via the forward SDE coefficients.
+                # f_node = self.module_x._sde_f_forward(zt_x, tau_hjb, ligand["mask"], temperature=temperature).to(dtype=zt_x.dtype)
+                # g2 = self.module_x._sde_g2_forward(tau_hjb, temperature=temperature)  # (B,)
+                # g2_node = torch.clamp(g2[ligand["mask"]].unsqueeze(-1), min=1e-12).to(dtype=zt_x.dtype)
                 
-                # force_fm_target is derived from raw geometric coords so it naturally sits in physical units.
-                force_fm_target = 2.0 * (v_true.to(dtype=zt_x.dtype) - f_node) / g2_node
+                # # force_fm_target is derived from raw geometric coords so it naturally sits in physical units.
+                # force_fm_target = 2.0 * (v_true.to(dtype=zt_x.dtype) - f_node) / g2_node
 
-                # Final background force used inside HJB/consistency (fully in physical units)
-                force_bg_phys = force_corr_phys + force_fm_target
+                # # Final background force used inside HJB/consistency (fully in physical units)
+                # force_bg_phys = force_corr_phys + force_fm_target
+                force_bg = force_corr + force_fm
 
-                u_pred_phys = pred_ligand["energy"].to(dtype=ligand["x"].dtype).view(-1) * target_s
-                du_dx_phys = du_dx_shared * target_s if du_dx_shared is not None else None
+                u_pred = pred_ligand["energy"].to(dtype=ligand["x"].dtype).view(-1) # * target_s
+                # du_dx_phys = du_dx_shared * target_s if du_dx_shared is not None else None
 
                 loss_hjb, loss_consistency = self.module_x.hjb_loss(
-                    force_bg_phys.to(dtype=ligand["x"].dtype),
-                    u_pred_phys,
+                    force_bg.to(dtype=ligand["x"].dtype),
+                    u_pred,
                     zt_x,
                     t_used,
                     ligand["mask"],
@@ -997,7 +1001,7 @@ class EnergyForceDiffusion(pl.LightningModule):
                     trace_batch_size=trace_batch_size,
                     compute_hjb=(float(self.lambda_hjb) > 0.0),
                     compute_consistency=(float(self.lambda_consistency) > 0.0),
-                    du_dx=du_dx_phys,
+                    du_dx=du_dx_shared,
                     debug=hjb_debug,
                 )
 
