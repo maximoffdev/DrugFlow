@@ -68,6 +68,11 @@ loss_params:
 
   lambda_hjb: 0.0
   lambda_consistency: 1.0
+  # Toggle the FM component used inside HJB/consistency:
+  #   False -> use the model-predicted FM force
+  #   True  -> use the target-derived FM force
+  # The correction term still comes from the model and retains its time interpolation.
+  hjb_use_target_force_fm: False
 
   # Boundary condition at the clean endpoint (flow-time t≈1): match forces via force_pred = -dE/dx.
   # NOTE: Flag name is legacy (`*_t0`). Under the current convention t=0 is most noisy and t=1 is clean.
