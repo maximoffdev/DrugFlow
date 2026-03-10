@@ -100,6 +100,9 @@ class EnergyForceDiffusion(pl.LightningModule):
         # Optional HJB PDE loss + force/energy consistency (at noisy time)
         set_default(loss_params, "lambda_hjb", 0.0)
         set_default(loss_params, "lambda_consistency", 0.0)
+        set_default(loss_params, "consistency_weight_by_snr", False)
+        set_default(loss_params, "consistency_use_min_snr", True)
+        set_default(loss_params, "consistency_min_snr_gamma", 5.0)
         set_default(loss_params, "reduce", "mean")
         # Must be one of {'CE', 'VLB'} to match src/model/markov_bridge.py
         set_default(loss_params, "discrete_loss", "CE")
@@ -136,6 +139,9 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.lambda_cfm = loss_params.lambda_cfm
         self.lambda_hjb = loss_params.lambda_hjb
         self.lambda_consistency = loss_params.lambda_consistency
+        self.consistency_weight_by_snr = bool(getattr(loss_params, "consistency_weight_by_snr", False))
+        self.consistency_use_min_snr = bool(getattr(loss_params, "consistency_use_min_snr", True))
+        self.consistency_min_snr_gamma = float(getattr(loss_params, "consistency_min_snr_gamma", 5.0))
 
         # Diffusion params
         self.n_steps = simulation_params.n_steps
@@ -930,15 +936,15 @@ class EnergyForceDiffusion(pl.LightningModule):
                 # construct v_true as an explicit function of x_t (=zt_x) rather than using the
                 # sampled eps_x (which is typically treated as constant w.r.t. x_t).
 
-                force_corr = pred_ligand.get("force_corr", None)
-                force_fm = pred_ligand.get("force_fm", None)
-                if force_corr is None:
-                    force_corr = torch.zeros_like(zt_x)
+                # force_corr = pred_ligand.get("force_corr", None)
+                # force_fm = pred_ligand.get("force_fm", None)
+                # if force_corr is None:
+                #     force_corr = torch.zeros_like(zt_x)
                 # else:
                 #     # Unscale model output to physical units
                 #     force_corr = force_corr.to(dtype=zt_x.dtype) * target_s
-                if force_fm is None:
-                    force_fm = torch.zeros_like(zt_x)
+                # if force_fm is None:
+                #     force_fm = torch.zeros_like(zt_x)
 
                 # # Diffusion forward-time tau: 0 clean -> 1 noisy.
                 # tau_hjb = 1.0 - t_used
@@ -988,8 +994,9 @@ class EnergyForceDiffusion(pl.LightningModule):
 
                 # # Final background force used inside HJB/consistency (fully in physical units)
                 # force_bg_phys = force_corr_phys + force_fm_target
-                force_bg = force_corr + force_fm
+                # force_bg = force_corr + force_fm
 
+                force_bg = pred_ligand.get("force", None)
                 u_pred = pred_ligand["energy"].to(dtype=ligand["x"].dtype).view(-1) # * target_s
                 # du_dx_phys = du_dx_shared * target_s if du_dx_shared is not None else None
 
@@ -1011,6 +1018,25 @@ class EnergyForceDiffusion(pl.LightningModule):
                     du_dx=du_dx_shared,
                     debug=hjb_debug,
                 )
+
+                if self.consistency_weight_by_snr and (float(self.lambda_consistency) > 0.0):
+                    # Weight only the constitutive relation term by SNR; keep HJB unweighted.
+                    # t_used is flow time (0 noisy -> 1 clean), whereas alpha/sigma use diffusion
+                    # forward-time tau (0 clean -> 1 noisy), so tau = 1 - t.
+                    tau_weight = (1.0 - t_used).detach()
+                    alpha_tau = self.module_x.alpha(tau_weight, temperature=temperature).view(-1)
+                    sigma_tau = self.module_x.sigma(tau_weight, temperature=temperature).view(-1)
+                    cons_w = (alpha_tau * alpha_tau) / torch.clamp(sigma_tau * sigma_tau, min=1e-12)
+
+                    if self.consistency_use_min_snr:
+                        cons_w = torch.clamp(cons_w, max=float(self.consistency_min_snr_gamma))
+
+                    # Do not further upweight graphs already forced to the clean boundary.
+                    if is_t0_graph is not None and bool(is_t0_graph.any()):
+                        cons_w = cons_w.clone()
+                        cons_w[is_t0_graph] = 1.0
+
+                    loss_consistency = loss_consistency * cons_w.to(dtype=loss_consistency.dtype)
 
         ######## Boundary conditions at t=0 (clean), computed on a subset of graphs. ########
         if need_energy_t0 or need_force_t0:
@@ -1049,11 +1075,12 @@ class EnergyForceDiffusion(pl.LightningModule):
                 if need_force_t0:
                     assert force is not None
                     # Force boundary uses background force: F_bg = F_fm + F_corr.
-                    force_fm = pred_ligand.get("force_fm", pred_ligand.get("force", pred_ligand.get("v", None)))
-                    force_corr = pred_ligand.get("force_corr", None)
-                    if force_fm is None:
+                    # force_fm = pred_ligand.get("force_fm", pred_ligand.get("force", pred_ligand.get("v", None)))
+                    # force_corr = pred_ligand.get("force_corr", None)
+                    force_pred = pred_ligand.get("force", None) 
+                    if force_pred is None:
                         raise RuntimeError("Internal error: force boundary requested but force output is missing")
-                    force_pred = force_fm if force_corr is None else (force_fm + force_corr)
+                    force_pred = pred_ligand.get("force", None) # force_fm if force_corr is None else (force_fm + force_corr)
                     force_tgt = force.to(device=ligand["x"].device, dtype=ligand["x"].dtype)
                     if force_tgt.shape != force_pred.shape:
                         raise ValueError(
