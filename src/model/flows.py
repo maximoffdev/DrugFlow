@@ -1194,6 +1194,10 @@ class CoordScoreDiffusion:
                 f"Term3: {torch.mean(0.5 * g2 * F_norm2 / temp_denom):.4f} | "
                 f"div_f: {div_f.mean():.4f} | "
                 f"Term5: {torch.mean(0.5 * g2 * div_F / temp_denom):.4f} |"
+                f"dU/dx: {du_dx.mean():.4f} | "
+                f"F_pred: {F_pred.mean():.4f} | "
+                f"HJB Loss: {loss_hjb.mean():.4f} | "
+                f"Consistency Loss: {loss_consistency.mean():.4f} | "
                 f"{mem_str}"
                 f"{flag_str}"
             )

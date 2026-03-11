@@ -127,7 +127,7 @@ class RadiusGVPDynamics(nn.Module):
             nn.Linear(2 * params.hidden_scalar_nf, self.atom_nf),
         )
 
-        ef_in_dim = params.hidden_scalar_nf + self.x_dim
+        ef_in_dim = 2 * params.hidden_scalar_nf + self.x_dim
         self.energy_node_head = nn.Sequential(
             nn.Linear(ef_in_dim, params.hidden_scalar_nf),
             nn.SiLU(),
@@ -208,26 +208,27 @@ class RadiusGVPDynamics(nn.Module):
 
         edges = self._build_edges(x_atoms, mask_atoms)
 
-        h_final, v, _ = self.net(h, x_atoms, edges, v=None, batch_mask=mask_atoms, edge_attr=None)
+        h_final, v, h_final_2, v_2, _ = self.net(h, x_atoms, edges, v=None, batch_mask=mask_atoms, edge_attr=None)
 
         logits_h = self.atom_decoder(h_final)
 
-        ef_feats = torch.cat([h_final, x_atoms.to(h_final.dtype)], dim=-1)
+        ef_feats = torch.cat([h_final, h_final_2, x_atoms.to(h_final.dtype)], dim=-1)
         energy_node = self.energy_node_head(ef_feats).squeeze(-1)
         energy = scatter_mean(energy_node, mask_atoms, dim=0)
 
-        force_feats = torch.cat([h_final, x_atoms.to(h_final.dtype), v.to(h_final.dtype)], dim=-1)
-        force_fm = self.force_fm_head(force_feats) * float(getattr(self.params, "force_fm_scale", 1.0))
-        force_corr = self.force_corr_head(force_feats) * float(getattr(self.params, "force_corr_scale", 1.0))
+        # force_feats = torch.cat([h_final, x_atoms.to(h_final.dtype), v.to(h_final.dtype)], dim=-1)
+        # force_fm = self.force_fm_head(force_feats) * float(getattr(self.params, "force_fm_scale", 1.0))
+        # force_corr = self.force_corr_head(force_feats) * float(getattr(self.params, "force_corr_scale", 1.0))
         
         # Optionally apply schedule: F_final_corr = force_corr * t
-        final_force_corr = force_corr
+        force_fm = v
+        final_force_corr = v_2 # force_corr
         if getattr(self.params, "force_corr_schedule", False):
             if t is None:
                 raise ValueError("t is required when force_corr_schedule=True")
             # t shape is usually (B,1), stretch to (N,1)
             t_node = t.to(device=h.device, dtype=h.dtype).view(1, 1).expand(h.size(0), 1) if t.numel() == 1 else t[mask_atoms].to(h.dtype)
-            final_force_corr = force_corr * t_node
+            final_force_corr = v_2 * t_node
 
         force = force_fm + final_force_corr
 

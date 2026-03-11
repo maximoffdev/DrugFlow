@@ -583,6 +583,10 @@ class GVPModel(torch.nn.Module):
             LayerNorm(node_h_dim, learnable_vector_weight=True),
             GVP(node_h_dim, (node_out_nf, 1), activations=(None, None), vector_gate=vector_gate),
         )
+        self.W_v_out_2 = nn.Sequential(
+            LayerNorm(node_h_dim, learnable_vector_weight=True),
+            GVP(node_h_dim, (node_out_nf, 1), activations=(None, None), vector_gate=vector_gate),
+        )
         # self.W_e_out = GVP(edge_h_dim, (edge_out_nf, 0),
         #                    activations=(None, None), vector_gate=True) \
         #     if self.update_edge_attr else None
@@ -642,9 +646,11 @@ class GVPModel(torch.nn.Module):
         # x = x.squeeze(-2)
         h, vel = self.W_v_out(h_v)
         # x = x + vel.squeeze(-2)
+        # TODO: add h2, vel2 = self.W_v_out2(h_v)
+        h_2, vel_2 = self.W_v_out_2(h_v)
 
         if self.update_edge_attr:
             edge_attr = self.W_e_out(h_e)
 
         # return h, x, edge_attr
-        return h, vel.squeeze(-2), edge_attr
+        return h, vel.squeeze(-2), h_2, vel_2.squeeze(-2), edge_attr
