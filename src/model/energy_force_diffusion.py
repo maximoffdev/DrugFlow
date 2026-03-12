@@ -90,9 +90,14 @@ class EnergyForceDiffusion(pl.LightningModule):
         set_default(train_params, "lr_step_size", None)
         set_default(train_params, "lr_gamma", None)
         set_default(train_params, "dataset_stats", None)
+        set_default(train_params, "pretrain_diff_epochs", 0)
         set_default(loss_params, "lambda_x", 1.0)
         set_default(loss_params, "lambda_h", 1.0)
         set_default(loss_params, "lambda_energy", 1.0)
+        set_default(loss_params, "lambda_force_dsm", 1.0)
+        set_default(loss_params, "lambda_energy_dsm", 1.0)
+        set_default(loss_params, "use_gamma_scaling", True)
+        set_default(loss_params, "gamma_envelope_eps", 1.0e-2)
         # Boundary condition at t=0: match predicted force (-∇E) to true forces.
         set_default(loss_params, "lambda_force_t0", 0.0)
         # Optional conditional flow-matching (CFM) velocity loss (VE kinematics).
@@ -116,6 +121,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.lr = train_params.lr
         self.lr_step_size = train_params.lr_step_size
         self.lr_gamma = train_params.lr_gamma
+        self.pretrain_diff_epochs = int(getattr(train_params, "pretrain_diff_epochs", 0))
 
         # UMA-style target scaling + (optional) energy referencing.
         self.target_sigma, self.omol_elem_ref = utils.parse_dataset_stats(getattr(train_params, "dataset_stats", None))
@@ -125,6 +131,10 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.lambda_x = loss_params.lambda_x
         self.lambda_h = loss_params.lambda_h
         self.lambda_energy = loss_params.lambda_energy
+        self.lambda_force_dsm = float(getattr(loss_params, "lambda_force_dsm", 1.0))
+        self.lambda_energy_dsm = float(getattr(loss_params, "lambda_energy_dsm", 1.0))
+        self.use_gamma_scaling = bool(getattr(loss_params, "use_gamma_scaling", True))
+        self.gamma_envelope_eps = float(getattr(loss_params, "gamma_envelope_eps", 1.0e-2))
         self.lambda_force_t0 = float(getattr(loss_params, "lambda_force_t0", 0.0))
         # Fraction of graphs in each batch forced to t=0 (used for boundary energy/force losses).
         # The remaining graphs keep their sampled diffusion times.
@@ -304,78 +314,10 @@ class EnergyForceDiffusion(pl.LightningModule):
             sde=logit_sde,
         )
 
-        backbone = getattr(predictor_params, "backbone", "radius_mlp")
-        if backbone == "gvp":
-            # Optional scaling for the two force heads (allows turning one off with 0.0).
-            set_default(predictor_params, "force_fm_scale", 1.0)
-            set_default(predictor_params, "force_corr_scale", 1.0)
-            gvp_params = getattr(predictor_params, "gvp_params", Namespace())
-            params = RadiusGVPParams(
-                hidden_scalar_nf=int(getattr(predictor_params, "hidden_nf", 128)),
-                condition_time=bool(getattr(predictor_params, "condition_time", True)),
-                condition_temperature=self.use_temperature,
-                edge_cutoff_ligand=getattr(predictor_params, "edge_cutoff_ligand", None),
-                knn_k=int(getattr(predictor_params, "knn_k", 30)),
-                n_layers=int(getattr(gvp_params, "n_layers", 5)),
-                node_h_dim_s=int(getattr(gvp_params, "node_h_dim", [128, 32])[0]),
-                node_h_dim_v=int(getattr(gvp_params, "node_h_dim", [128, 32])[1]),
-                edge_h_dim_s=int(getattr(gvp_params, "edge_h_dim", [128, 32])[0]),
-                edge_h_dim_v=int(getattr(gvp_params, "edge_h_dim", [128, 32])[1]),
-                dropout=float(getattr(gvp_params, "dropout", 0.1)),
-                vector_gate=bool(getattr(gvp_params, "vector_gate", True)),
-                reflection_equivariant=bool(getattr(predictor_params, "reflection_equivariant", False)),
-                d_max=float(getattr(predictor_params, "d_max", 15.0)),
-                num_rbf=int(getattr(predictor_params, "num_rbf", 16)),
-                force_fm_scale=float(getattr(predictor_params, "force_fm_scale", 1.0)),
-                force_corr_scale=float(getattr(predictor_params, "force_corr_scale", 1.0)),
-                force_corr_schedule=bool(getattr(predictor_params, "force_corr_schedule", False)),
-            )
-            self.dynamics = RadiusGVPDynamics(atom_nf=self.atom_nf, x_dim=self.x_dim, params=params)
-            self.condition_time = bool(getattr(predictor_params, "condition_time", True))
-        elif backbone == "radius_mlp":
-            radius_mlp = getattr(predictor_params, "radius_mlp", Namespace())
-            hidden_dim = getattr(radius_mlp, "hidden_dim", 256)
-            n_layers = getattr(radius_mlp, "n_layers", 3)
-            condition_time = getattr(radius_mlp, "condition_time", True)
-            # Single source of truth for temperature conditioning:
-            # if disabled, temperature must not be required or consumed by the backbone.
-            condition_temperature = self.use_temperature
-            params = RadiusMLPParams(
-                hidden_dim=hidden_dim,
-                n_layers=n_layers,
-                condition_time=condition_time,
-                condition_temperature=condition_temperature,
-            )
-            self.dynamics = RadiusMLPDynamics(atom_nf=self.atom_nf, x_dim=self.x_dim, params=params)
-            self.condition_time = bool(condition_time)
-        elif backbone == "scorenet_mlp":
-            scorenet_mlp = getattr(predictor_params, "scorenet_mlp", Namespace())
-            hidden_dim = int(getattr(scorenet_mlp, "hidden_dim", 128))
-            time_emb_dim = int(getattr(scorenet_mlp, "time_emb_dim", 64))
-            num_layers = int(getattr(scorenet_mlp, "num_layers", 3))
-            condition_time = bool(getattr(scorenet_mlp, "condition_time", True))
-            # Keep temperature conditioning controlled by simulation_params.use_temperature.
-            condition_temperature = bool(self.use_temperature)
-
-            set_default(predictor_params, "force_fm_scale", float(getattr(scorenet_mlp, "force_fm_scale", 1.0)))
-            set_default(predictor_params, "force_corr_scale", float(getattr(scorenet_mlp, "force_corr_scale", 1.0)))
-            set_default(predictor_params, "force_corr_schedule", bool(getattr(scorenet_mlp, "force_corr_schedule", False)))
-
-            params = ScoreNetMLPParams(
-                input_dim=2,
-                hidden_dim=hidden_dim,
-                time_emb_dim=time_emb_dim,
-                num_layers=num_layers,
-                condition_time=condition_time,
-                condition_temperature=condition_temperature,
-                force_fm_scale=float(getattr(predictor_params, "force_fm_scale", 1.0)),
-                force_corr_scale=float(getattr(predictor_params, "force_corr_scale", 1.0)),
-                force_corr_schedule=bool(getattr(predictor_params, "force_corr_schedule", False)),
-            )
-            self.dynamics = ScoreNetMLPDynamics(atom_nf=self.atom_nf, x_dim=self.x_dim, params=params)
-            self.condition_time = bool(condition_time)
-        else:
-            raise ValueError(f"Unknown predictor_params.backbone: {backbone}")
+        self.dynamics_diff, self.condition_time = self._build_dynamics_module(predictor_params)
+        self.dynamics_corr, condition_time_corr = self._build_dynamics_module(predictor_params)
+        if bool(self.condition_time) != bool(condition_time_corr):
+            raise ValueError("Diffusion and correction predictors must agree on condition_time")
 
         if (float(self.lambda_x) > 0.0 or float(self.lambda_h) > 0.0) and (not getattr(self, "condition_time", True)):
             warnings.warn(
@@ -403,6 +345,190 @@ class EnergyForceDiffusion(pl.LightningModule):
             raise ValueError("loss_params.hjb_divergence must be one of: exact, hutchinson")
         if self.hjb_trace_samples <= 0:
             raise ValueError("loss_params.hjb_trace_samples must be >= 1")
+
+        self._active_training_phase: str | None = None
+        self._apply_training_phase(self._phase_name_for_epoch(0))
+
+    def _build_dynamics_module(self, predictor_params: Namespace):
+        backbone = getattr(predictor_params, "backbone", "radius_mlp")
+        if backbone == "gvp":
+            set_default(predictor_params, "force_fm_scale", 1.0)
+            set_default(predictor_params, "force_corr_scale", 1.0)
+            gvp_params = getattr(predictor_params, "gvp_params", Namespace())
+            params = RadiusGVPParams(
+                hidden_scalar_nf=int(getattr(predictor_params, "hidden_nf", 128)),
+                condition_time=bool(getattr(predictor_params, "condition_time", True)),
+                condition_temperature=self.use_temperature,
+                edge_cutoff_ligand=getattr(predictor_params, "edge_cutoff_ligand", None),
+                knn_k=int(getattr(predictor_params, "knn_k", 30)),
+                n_layers=int(getattr(gvp_params, "n_layers", 5)),
+                node_h_dim_s=int(getattr(gvp_params, "node_h_dim", [128, 32])[0]),
+                node_h_dim_v=int(getattr(gvp_params, "node_h_dim", [128, 32])[1]),
+                edge_h_dim_s=int(getattr(gvp_params, "edge_h_dim", [128, 32])[0]),
+                edge_h_dim_v=int(getattr(gvp_params, "edge_h_dim", [128, 32])[1]),
+                dropout=float(getattr(gvp_params, "dropout", 0.1)),
+                vector_gate=bool(getattr(gvp_params, "vector_gate", True)),
+                reflection_equivariant=bool(getattr(predictor_params, "reflection_equivariant", False)),
+                d_max=float(getattr(predictor_params, "d_max", 15.0)),
+                num_rbf=int(getattr(predictor_params, "num_rbf", 16)),
+                force_fm_scale=float(getattr(predictor_params, "force_fm_scale", 1.0)),
+                force_corr_scale=float(getattr(predictor_params, "force_corr_scale", 1.0)),
+                force_corr_schedule=bool(getattr(predictor_params, "force_corr_schedule", False)),
+            )
+            return RadiusGVPDynamics(atom_nf=self.atom_nf, x_dim=self.x_dim, params=params), bool(getattr(predictor_params, "condition_time", True))
+
+        if backbone == "radius_mlp":
+            radius_mlp = getattr(predictor_params, "radius_mlp", Namespace())
+            hidden_dim = getattr(radius_mlp, "hidden_dim", 256)
+            n_layers = getattr(radius_mlp, "n_layers", 3)
+            condition_time = getattr(radius_mlp, "condition_time", True)
+            params = RadiusMLPParams(
+                hidden_dim=hidden_dim,
+                n_layers=n_layers,
+                condition_time=condition_time,
+                condition_temperature=self.use_temperature,
+            )
+            return RadiusMLPDynamics(atom_nf=self.atom_nf, x_dim=self.x_dim, params=params), bool(condition_time)
+
+        if backbone == "scorenet_mlp":
+            scorenet_mlp = getattr(predictor_params, "scorenet_mlp", Namespace())
+            hidden_dim = int(getattr(scorenet_mlp, "hidden_dim", 128))
+            time_emb_dim = int(getattr(scorenet_mlp, "time_emb_dim", 64))
+            num_layers = int(getattr(scorenet_mlp, "num_layers", 3))
+            condition_time = bool(getattr(scorenet_mlp, "condition_time", True))
+
+            set_default(predictor_params, "force_fm_scale", float(getattr(scorenet_mlp, "force_fm_scale", 1.0)))
+            set_default(predictor_params, "force_corr_scale", float(getattr(scorenet_mlp, "force_corr_scale", 1.0)))
+            set_default(predictor_params, "force_corr_schedule", bool(getattr(scorenet_mlp, "force_corr_schedule", False)))
+
+            params = ScoreNetMLPParams(
+                input_dim=2,
+                hidden_dim=hidden_dim,
+                time_emb_dim=time_emb_dim,
+                num_layers=num_layers,
+                condition_time=condition_time,
+                condition_temperature=bool(self.use_temperature),
+                force_fm_scale=float(getattr(predictor_params, "force_fm_scale", 1.0)),
+                force_corr_scale=float(getattr(predictor_params, "force_corr_scale", 1.0)),
+                force_corr_schedule=bool(getattr(predictor_params, "force_corr_schedule", False)),
+            )
+            return ScoreNetMLPDynamics(atom_nf=self.atom_nf, x_dim=self.x_dim, params=params), bool(condition_time)
+
+        raise ValueError(f"Unknown predictor_params.backbone: {backbone}")
+
+    @staticmethod
+    def _set_module_requires_grad(module: torch.nn.Module, enabled: bool) -> None:
+        for param in module.parameters():
+            param.requires_grad = enabled
+
+    def _phase_name_for_epoch(self, epoch: int | None = None) -> str:
+        epoch_idx = int(self.current_epoch if epoch is None else epoch)
+        return "pretrain_diff" if epoch_idx < self.pretrain_diff_epochs else "correction"
+
+    def _apply_training_phase(self, phase: str) -> None:
+        if phase == self._active_training_phase:
+            return
+        if phase == "pretrain_diff":
+            self._set_module_requires_grad(self.dynamics_diff, True)
+            self._set_module_requires_grad(self.dynamics_corr, False)
+        elif phase == "correction":
+            self._set_module_requires_grad(self.dynamics_diff, False)
+            self._set_module_requires_grad(self.dynamics_corr, True)
+        else:
+            raise ValueError(f"Unknown training phase: {phase}")
+        self._active_training_phase = phase
+
+    def _gamma_envelope(self, t: torch.Tensor, temperature: torch.Tensor | float | None = None) -> torch.Tensor:
+        if not self.use_gamma_scaling:
+            return torch.ones_like(t)
+        tau = 1.0 - torch.clamp(t, 0.0, 1.0)
+        if isinstance(temperature, (int, float)):
+            temperature_t = torch.full_like(t, float(temperature))
+        else:
+            temperature_t = temperature
+        sigma = self.module_x.sigma(tau, temperature=temperature_t)
+        sigma2 = sigma * sigma
+        return sigma2 / torch.clamp(sigma2 + float(self.gamma_envelope_eps), min=1e-12)
+
+    def _combine_predictions(
+        self,
+        pred_diff: dict,
+        pred_corr: dict | None,
+        batch_mask: torch.Tensor,
+        t: torch.Tensor,
+        temperature: torch.Tensor | float | None = None,
+    ) -> dict:
+        if pred_corr is None:
+            gamma_graph = torch.ones((t.size(0), 1), device=t.device, dtype=t.dtype)
+            gamma_node = gamma_graph[batch_mask]
+            return {
+                **pred_diff,
+                "energy_diff": pred_diff["energy"],
+                "energy_corr": torch.zeros_like(pred_diff["energy"]),
+                "force_diff": pred_diff["force"],
+                "force_corr_model": torch.zeros_like(pred_diff["force"]),
+                "gamma_graph": gamma_graph,
+                "gamma_node": gamma_node,
+            }
+
+        gamma_graph = self._gamma_envelope(t, temperature=temperature).to(dtype=pred_diff["energy"].dtype)
+        gamma_node = gamma_graph[batch_mask].to(dtype=pred_diff["force"].dtype)
+        return {
+            **pred_diff,
+            "energy": gamma_graph.view(-1) * pred_diff["energy"].view(-1) + pred_corr["energy"].view(-1),
+            "force": gamma_node * pred_diff["force"] + pred_corr["force"],
+            "logits_h": pred_diff.get("logits_h", pred_corr.get("logits_h")),
+            "energy_diff": pred_diff["energy"],
+            "energy_corr": pred_corr["energy"],
+            "force_diff": pred_diff["force"],
+            "force_corr_model": pred_corr["force"],
+            "gamma_graph": gamma_graph,
+            "gamma_node": gamma_node,
+        }
+
+    def _forward_model_components(
+        self,
+        x: torch.Tensor,
+        h: torch.Tensor,
+        batch_mask: torch.Tensor,
+        t: torch.Tensor,
+        temperature: torch.Tensor | float | None = None,
+        *,
+        correction_active: bool,
+    ) -> tuple[dict, dict | None, dict]:
+        pred_diff, _ = self.dynamics_diff(
+            x,
+            h,
+            batch_mask,
+            pocket=None,
+            t=t,
+            temperature=temperature,
+            bonds_ligand=None,
+            sc_transform=None,
+        )
+        pred_corr = None
+        if correction_active:
+            pred_corr, _ = self.dynamics_corr(
+                x,
+                h,
+                batch_mask,
+                pocket=None,
+                t=t,
+                temperature=temperature,
+                bonds_ligand=None,
+                sc_transform=None,
+            )
+        pred_total = self._combine_predictions(pred_diff, pred_corr, batch_mask, t, temperature=temperature)
+        return pred_diff, pred_corr, pred_total
+
+    def on_train_epoch_start(self) -> None:
+        self._apply_training_phase(self._phase_name_for_epoch())
+
+    def on_validation_epoch_start(self) -> None:
+        self._apply_training_phase(self._phase_name_for_epoch())
+
+    def on_test_epoch_start(self) -> None:
+        self._apply_training_phase(self._phase_name_for_epoch())
 
     def configure_optimizers(self):
         optimizers = [
@@ -715,23 +841,32 @@ class EnergyForceDiffusion(pl.LightningModule):
                     temperature = temperature.to(device=ligand["x"].device, dtype=t.dtype)
                     temp_val = float(temperature[0].detach().cpu().item())
 
-        # Coordinate loss in the flow-matching setting is the constitutive relation loss
-        # (ties velocity to energy gradient + SDE coefficients).
+        phase_name = self._phase_name_for_epoch()
+        correction_active = phase_name == "correction"
+
         need_x = float(self.lambda_x) > 0.0
         need_h = float(self.lambda_h) > 0.0 and bool(self.diffuse_h)
         need_cfm = float(getattr(self, "lambda_cfm", 0.0)) > 0.0
-        need_hjb = float(self.lambda_hjb) > 0.0
-        need_consistency = float(self.lambda_consistency) > 0.0
+        need_force_dsm = float(self.lambda_force_dsm) > 0.0
+        need_energy_dsm = float(self.lambda_energy_dsm) > 0.0
+        need_hjb = correction_active and float(self.lambda_hjb) > 0.0
+        need_consistency = correction_active and float(self.lambda_consistency) > 0.0
 
         # Boundary conditions at the clean endpoint (flow-time t=1).
-        # NOTE: config flag names are legacy (`*_t0`), but under the current convention
-        # flow-time is t=0 most noisy -> t=1 clean, so the boundary is enforced at t≈1.
-        need_energy_t0 = (energy is not None) and (float(self.lambda_energy) > 0.0)
-        need_force_t0 = (force is not None) and (float(getattr(self, "lambda_force_t0", 0.0)) > 0.0)
+        need_energy_t0 = correction_active and (energy is not None) and (float(self.lambda_energy) > 0.0)
+        need_force_t0 = correction_active and (force is not None) and (float(getattr(self, "lambda_force_t0", 0.0)) > 0.0)
 
-        # We run a single forward pass for all enabled losses. For boundary losses we force a
-        # fixed fraction of the *graphs* to have t≈1 and keep x clean for those graphs.
-        need_main_pass = need_x or need_h or need_cfm or need_hjb or need_consistency or need_energy_t0 or need_force_t0
+        need_main_pass = (
+            need_x
+            or need_h
+            or need_cfm
+            or need_force_dsm
+            or need_energy_dsm
+            or need_hjb
+            or need_consistency
+            or need_energy_t0
+            or need_force_t0
+        )
 
         # Apply a fixed fraction of graphs at t≈1 (for boundary losses), keep the rest at their sampled t.
         # This reduces cost by computing du/dx once and reusing it for both boundary force loss and HJB.
@@ -815,10 +950,9 @@ class EnergyForceDiffusion(pl.LightningModule):
             t_used = t
             is_t0_graph = None
 
-        # Flow-matching PDE losses require gradients w.r.t. (t, x). Boundary force loss also
-        # requires du/dx. Lightning runs validation/test under torch.no_grad(), so we selectively
-        # re-enable grad when needed.
-        need_time_space_grads = need_hjb or need_x or need_consistency or need_force_t0 or need_cfm
+        # Lightning runs validation/test under torch.no_grad(), so we selectively re-enable
+        # autograd for the energy-gradient and HJB terms.
+        need_time_space_grads = need_hjb or need_x or need_consistency or need_energy_dsm or need_cfm
 
         # Only train with higher-order autodiff; during eval we can compute the residuals
         # with create_graph=False to avoid massive memory usage.
@@ -836,21 +970,20 @@ class EnergyForceDiffusion(pl.LightningModule):
             assert zt_h is not None
             with grad_ctx:
                 zt_x = zt_x.detach().requires_grad_(need_time_space_grads)
-                t_used = t_used.detach().requires_grad_(need_time_space_grads)
+                t_used = t_used.detach().requires_grad_(need_hjb)
 
-                pred_ligand, _ = self.dynamics(
+                pred_diff, pred_corr, pred_total = self._forward_model_components(
                     zt_x,
                     zt_h,
                     ligand["mask"],
-                    pocket=None,
-                    t=t_used,
+                    t_used,
                     temperature=temperature,
-                    bonds_ligand=None,
-                    sc_transform=None,
+                    correction_active=correction_active,
                 )
         else:
-            # No noisy pass needed; keep placeholders for logging.
-            pred_ligand = None
+            pred_diff = None
+            pred_corr = None
+            pred_total = None
 
         # Coordinate flow-matching losses (computed at the *noisy* state (zt_x, t)).
         # This implements:
@@ -862,13 +995,13 @@ class EnergyForceDiffusion(pl.LightningModule):
         ######## Compute atom-type loss ########
 
         if need_h and self.diffuse_h and (self.lambda_h is None or float(self.lambda_h) != 0.0):
-            assert pred_ligand is not None
+            assert pred_total is not None
             assert zt_h is not None
             # Markov-bridge time convention matches flow-time: 0 noisy -> 1 clean.
             t_mb = t
             t_next = torch.clamp(t_mb + self.train_step_size, max=1.0)
             loss_h = self.module_h.compute_loss(
-                pred_ligand["logits_h"],
+                pred_total["logits_h"],
                 zt_h,
                 ligand["one_hot"],
                 ligand["mask"],
@@ -883,176 +1016,89 @@ class EnergyForceDiffusion(pl.LightningModule):
         loss_energy = torch.zeros_like(loss_x)
         loss_energy_t0 = torch.zeros_like(loss_x)
         loss_force_t0 = torch.zeros_like(loss_x)
+        loss_force_dsm = torch.zeros_like(loss_x)
+        loss_energy_dsm = torch.zeros_like(loss_x)
         loss_cfm = torch.zeros_like(loss_x)
         loss_hjb = torch.zeros_like(loss_x)
         loss_consistency = torch.zeros_like(loss_x)
 
-        # compute_ef = (
-        #     (energy is not None)
-        #     or (force is not None)
-        #     or (float(self.lambda_bc) > 0.0)
-        #     or (float(self.lambda_hjb) > 0.0)
-        #     or (float(self.lambda_consistency) > 0.0)
-        # )
-        # if compute_ef:
+        ######## Phase 1: diffusion-base DSM pretraining. ########
+        grad_energy_corr = None
+        if need_force_dsm or need_energy_dsm:
+            assert pred_diff is not None
+            assert zt_x is not None
+            tau_noisy = 1.0 - t_used
+            force_target = self.module_x.score_target(
+                zt_x,
+                ligand["x"],
+                tau_noisy,
+                ligand["mask"],
+                temperature=temperature,
+            ).to(dtype=ligand["x"].dtype)
+            sigma_tau = self.module_x.sigma(tau_noisy, temperature=temperature)[ligand["mask"]].squeeze(-1)
+            dsm_weight = torch.clamp(sigma_tau * sigma_tau, min=1e-12)
 
-        ######## Force-based HJB + consistency losses at the state (zt_x, t). ########
-        # Compute du/dx once (reused for HJB/consistency and for the t=0 force boundary loss).
-        du_dx_shared = None
-        need_shared_du_dx = need_force_t0 or need_hjb or need_consistency
-        if need_shared_du_dx:
-            if pred_ligand is None or zt_x is None:
-                raise RuntimeError("Internal error: need du/dx but pred_ligand/zt_x is missing")
-            with grad_ctx:
-                u_pred = pred_ligand["energy"].to(dtype=ligand["x"].dtype).view(-1)
-                # Need create_graph for training through force boundary or HJB higher-order.
-                create_graph = bool((enable_higher_order and (need_hjb or need_consistency)) or (need_force_t0 and self.training))
-                du_dx_shared = torch.autograd.grad(
-                    outputs=u_pred.sum(),
+            if need_force_dsm:
+                force_diff = pred_diff.get("force", pred_diff.get("v", None))
+                if force_diff is None:
+                    raise RuntimeError("Internal error: diffusion predictor must return a force field")
+                per_node_force_dsm = torch.mean((force_diff.to(dtype=ligand["x"].dtype) - force_target) ** 2, dim=-1)
+                loss_force_dsm = scatter_mean(per_node_force_dsm * dsm_weight, ligand["mask"], dim=0)
+
+            if need_energy_dsm:
+                energy_diff = pred_diff["energy"].to(dtype=ligand["x"].dtype).view(-1)
+                grad_energy_diff = torch.autograd.grad(
+                    outputs=energy_diff.sum(),
                     inputs=zt_x,
-                    create_graph=create_graph,
+                    create_graph=bool(self.training),
                     retain_graph=True,
                     allow_unused=False,
                 )[0]
+                per_node_energy_dsm = torch.mean(((-grad_energy_diff) - force_target) ** 2, dim=-1)
+                loss_energy_dsm = scatter_mean(per_node_energy_dsm * dsm_weight, ligand["mask"], dim=0)
 
-        if (float(self.lambda_hjb) > 0.0) or (float(self.lambda_consistency) > 0.0):
-            assert pred_ligand is not None
+        ######## Phase 2: correction consistency and total-field HJB. ########
+        if need_consistency:
+            assert pred_corr is not None
             assert zt_x is not None
-            assert zt_h is not None
-            # Lightning wraps validation/test in torch.no_grad(). Autograd-based HJB terms
-            # must run under torch.enable_grad() to build the necessary graphs.
-            with grad_ctx:
-                # target_s = float(getattr(self, "target_sigma", 1.0))
-                
-                # Continuity (HJB) is computed either on the noisy samples OR on uniform
-                # points, depending on `hjb_eval_points`. In particular, if
-                # hjb_eval_points=='uniform', we do NOT compute HJB on the diffused samples.
+            energy_corr = pred_corr["energy"].to(dtype=ligand["x"].dtype).view(-1)
+            grad_energy_corr = torch.autograd.grad(
+                outputs=energy_corr.sum(),
+                inputs=zt_x,
+                create_graph=bool(self.training),
+                retain_graph=True,
+                allow_unused=False,
+            )[0]
+            per_node_cons = torch.mean((pred_corr["force"].to(dtype=ligand["x"].dtype) + grad_energy_corr) ** 2, dim=-1)
+            loss_consistency = scatter_mean(per_node_cons, ligand["mask"], dim=0)
 
-                # Use the background force for HJB/consistency:
-                #   F_bg(x,t) = F_corr,pred(x,t) + F_fm,target(x,t)
-                # where F_fm,target is derived from the flow-matching target velocity v_true
-                # and converted into a force using the ODE relationship:
-                #   v = f + 0.5 * g^2 * F  =>  F = 2 (v - f) / g^2.
-                #
-                # IMPORTANT: to get a non-trivial divergence contribution from the target term,
-                # construct v_true as an explicit function of x_t (=zt_x) rather than using the
-                # sampled eps_x (which is typically treated as constant w.r.t. x_t).
-
-                force_corr = pred_ligand.get("force_corr", None)
-                force_fm_pred = pred_ligand.get("force_fm", None)
-                if force_corr is None:
-                    force_corr = torch.zeros_like(zt_x)
-                else:
-                    # `force_corr` is already time-interpolated inside the dynamics when enabled.
-                    force_corr = force_corr.to(dtype=zt_x.dtype)
-                if force_fm_pred is not None:
-                    force_fm_pred = force_fm_pred.to(dtype=zt_x.dtype)
-
-                # Diffusion forward-time tau: 0 clean -> 1 noisy.
-                tau_hjb = 1.0 - t_used
-
-                # Compute epsilon as a function of x_t and x0 so v_true is differentiable w.r.t. x_t.
-                a_tau = self.module_x.alpha(tau_hjb, temperature=temperature)  # (B,1)
-                sigma_tau = self.module_x.sigma(tau_hjb, temperature=temperature)  # (B,1)
-                a_node = a_tau[ligand["mask"]]
-                sigma_node = torch.clamp(sigma_tau[ligand["mask"]], min=1e-12)
-                eps_from_xt = (zt_x - a_node * ligand["x"]) / sigma_node
-
-                # Flow-time derivatives d/dt (flow-time t=0 noisy -> 1 clean).
-                # We use tau = 1 - t, so d/dt = -d/dtau.
-                if self.module_x.sde.kind == "ve":
-                    log_ratio = float(np.log(float(self.module_x.sde.sigma_max) / float(self.module_x.sde.sigma_min)))
-                    d_alpha_dt = torch.zeros_like(a_tau)
-                    d_sigma_dt = -sigma_tau * log_ratio
-                elif self.module_x.sde.kind == "vp":
-                    beta0 = float(self.module_x.sde.beta_min)
-                    beta1 = float(self.module_x.sde.beta_max)
-                    beta = beta0 + (beta1 - beta0) * tau_hjb
-                    if isinstance(temperature, torch.Tensor):
-                        beta = beta * torch.clamp(temperature.to(device=beta.device, dtype=beta.dtype), min=1e-6)
-
-                    # alpha(tau) = exp(-0.5 * int_0^tau beta(s) ds) => d alpha/d tau = -0.5 * beta(tau) * alpha.
-                    # d alpha/d t(flow) = - d alpha/d tau.
-                    d_alpha_dt = 0.5 * beta * a_tau
-
-                    # sigma(tau) = vp_sigma_scale * sqrt(1 - alpha(tau)^2).
-                    # d sigma/d tau = 0.5 * beta(tau) * vp_sigma_scale^2 * alpha(tau)^2 / sigma(tau)
-                    # d sigma/d t(flow) = - d sigma/d tau.
-                    vp_scale = float(self.module_x.sde.vp_sigma_scale)
-                    sigma_tau_clamped = torch.clamp(sigma_tau, min=1e-12)
-                    d_sigma_dt = -0.5 * beta * (vp_scale * vp_scale) * (a_tau * a_tau) / sigma_tau_clamped
-                else:
-                    raise ValueError(f"Unknown SDE kind: {self.module_x.sde.kind}")
-
-                v_true = d_alpha_dt[ligand["mask"]] * ligand["x"] + d_sigma_dt[ligand["mask"]] * eps_from_xt
-
-                # Convert target velocity into a target force via the forward SDE coefficients.
-                f_node = self.module_x._sde_f_forward(zt_x, tau_hjb, ligand["mask"], temperature=temperature).to(dtype=zt_x.dtype)
-                g2 = self.module_x._sde_g2_forward(tau_hjb, temperature=temperature)  # (B,)
-                g2_node = torch.clamp(g2[ligand["mask"]].unsqueeze(-1), min=1e-12).to(dtype=zt_x.dtype)
-                
-                # force_fm_target is derived from raw geometric coords so it naturally sits in physical units.
-                force_fm_target = 2.0 * (v_true.to(dtype=zt_x.dtype) - f_node) / g2_node
-
-                # Final background force used inside HJB/consistency.
-                # The correction term already carries the same time interpolation used during
-                # training/sampling; the flag only toggles which FM term is added to it.
-                if self.hjb_use_target_force_fm:
-                    force_bg = force_corr + force_fm_target
-                else:
-                    if force_fm_pred is not None:
-                        force_bg = force_corr + force_fm_pred
-                    else:
-                        force_bg = pred_ligand.get("force", pred_ligand.get("v", None))
-                        if force_bg is None:
-                            raise KeyError("Dynamics must return either ('force_corr' and 'force_fm') or combined 'force'/'v'")
-                        force_bg = force_bg.to(dtype=zt_x.dtype)
-
-                u_pred = pred_ligand["energy"].to(dtype=ligand["x"].dtype).view(-1) # * target_s
-                # du_dx_phys = du_dx_shared * target_s if du_dx_shared is not None else None
-
-                loss_hjb, loss_consistency = self.module_x.hjb_loss(
-                    force_bg.to(dtype=ligand["x"].dtype),
-                    u_pred,
-                    zt_x,
-                    t_used,
-                    ligand["mask"],
-                    temperature=temperature,
-                    reduce=self.loss_reduce,
-                    divergence=cast(Literal["exact", "hutchinson"], self.hjb_divergence),
-                    n_trace_samples=self.hjb_trace_samples,
-                    enable_higher_order=enable_higher_order,
-                    divergence_create_graph=divergence_create_graph,
-                    trace_batch_size=trace_batch_size,
-                    compute_hjb=(float(self.lambda_hjb) > 0.0),
-                    compute_consistency=(float(self.lambda_consistency) > 0.0),
-                    du_dx=du_dx_shared,
-                    debug=hjb_debug,
-                )
-
-                if self.consistency_weight_by_snr and (float(self.lambda_consistency) > 0.0):
-                    # Weight only the constitutive relation term by SNR; keep HJB unweighted.
-                    # t_used is flow time (0 noisy -> 1 clean), whereas alpha/sigma use diffusion
-                    # forward-time tau (0 clean -> 1 noisy), so tau = 1 - t.
-                    tau_weight = (1.0 - t_used).detach()
-                    alpha_tau = self.module_x.alpha(tau_weight, temperature=temperature).view(-1)
-                    sigma_tau = self.module_x.sigma(tau_weight, temperature=temperature).view(-1)
-                    cons_w = (alpha_tau * alpha_tau) / torch.clamp(sigma_tau * sigma_tau, min=1e-12)
-
-                    if self.consistency_use_min_snr:
-                        cons_w = torch.clamp(cons_w, max=float(self.consistency_min_snr_gamma))
-
-                    # Do not further upweight graphs already forced to the clean boundary.
-                    if is_t0_graph is not None and bool(is_t0_graph.any()):
-                        cons_w = cons_w.clone()
-                        cons_w[is_t0_graph] = 1.0
-
-                    loss_consistency = loss_consistency * cons_w.to(dtype=loss_consistency.dtype)
+        if need_hjb:
+            assert pred_total is not None
+            assert zt_x is not None
+            loss_hjb, _ = self.module_x.hjb_loss(
+                pred_total["force"].to(dtype=ligand["x"].dtype),
+                pred_corr["force"].to(dtype=ligand["x"].dtype) if pred_corr is not None else pred_total["force"].to(dtype=ligand["x"].dtype),
+                pred_total["energy"].to(dtype=ligand["x"].dtype).view(-1),
+                zt_x,
+                t_used,
+                ligand["mask"],
+                temperature=temperature,
+                reduce=self.loss_reduce,
+                divergence=cast(Literal["exact", "hutchinson"], self.hjb_divergence),
+                n_trace_samples=self.hjb_trace_samples,
+                enable_higher_order=enable_higher_order,
+                divergence_create_graph=divergence_create_graph,
+                trace_batch_size=trace_batch_size,
+                compute_hjb=True,
+                compute_consistency=False,
+                du_dx=grad_energy_corr,
+                debug=hjb_debug,
+            )
 
         ######## Boundary conditions at t=0 (clean), computed on a subset of graphs. ########
         if need_energy_t0 or need_force_t0:
-            if pred_ligand is None:
-                raise RuntimeError("Internal error: boundary losses requested but pred_ligand is missing")
+            if pred_total is None:
+                raise RuntimeError("Internal error: boundary losses requested but total prediction is missing")
             if is_t0_graph is None:
                 raise RuntimeError("Internal error: is_t0_graph missing")
 
@@ -1060,7 +1106,7 @@ class EnergyForceDiffusion(pl.LightningModule):
                 if need_energy_t0:
                     assert energy is not None
                     energy_tgt = energy.to(device=ligand["x"].device, dtype=ligand["x"].dtype).view(-1)
-                    energy_pred = pred_ligand["energy"].to(dtype=ligand["x"].dtype).view(-1)
+                    energy_pred = pred_total["energy"].to(dtype=ligand["x"].dtype).view(-1)
                     if energy_pred.shape != energy_tgt.shape:
                         raise ValueError(
                             f"energy_pred must have shape (B,), got {tuple(energy_pred.shape)} vs target {tuple(energy_tgt.shape)}"
@@ -1079,19 +1125,14 @@ class EnergyForceDiffusion(pl.LightningModule):
                     # Target scaling: x_scaled = x / sigma (mu=0).
                     energy_tgt = utils.scale_target(energy_tgt, float(getattr(self, "target_sigma", 1.0)))
 
-                    # Per-atom MAE on total energy.
-                    loss_energy = torch.abs(energy_pred - energy_tgt) / ligand["size"].to(dtype=energy_pred.dtype)
+                    loss_energy = torch.abs(energy_pred - energy_tgt)
                     loss_energy = loss_energy * is_t0_graph.to(dtype=loss_energy.dtype)
 
                 if need_force_t0:
                     assert force is not None
-                    # Force boundary uses background force: F_bg = F_fm + F_corr.
-                    # force_fm = pred_ligand.get("force_fm", pred_ligand.get("force", pred_ligand.get("v", None)))
-                    # force_corr = pred_ligand.get("force_corr", None)
-                    force_pred = pred_ligand.get("force", None) 
+                    force_pred = pred_total.get("force", None)
                     if force_pred is None:
                         raise RuntimeError("Internal error: force boundary requested but force output is missing")
-                    force_pred = pred_ligand.get("force", None) # force_fm if force_corr is None else (force_fm + force_corr)
                     force_tgt = force.to(device=ligand["x"].device, dtype=ligand["x"].dtype)
                     if force_tgt.shape != force_pred.shape:
                         raise ValueError(
@@ -1102,24 +1143,18 @@ class EnergyForceDiffusion(pl.LightningModule):
                     force_tgt = utils.scale_target(force_tgt, float(getattr(self, "target_sigma", 1.0)))
 
                     is_t0_node = is_t0_graph[ligand["mask"]]
-                    per_node = torch.sum((force_pred - force_tgt) ** 2, dim=-1)
+                    per_node = torch.mean((force_pred.to(dtype=ligand["x"].dtype) - force_tgt) ** 2, dim=-1)
                     per_node = per_node * is_t0_node.to(dtype=per_node.dtype)
-                    # Per-atom mean squared L2 error on forces.
                     loss_force_t0 = scatter_mean(per_node, ligand["mask"], dim=0)
             else:
-                # No t=0 graphs in this batch.
                 loss_energy = torch.zeros_like(loss_x)
                 loss_force_t0 = torch.zeros_like(loss_x)
-
-            # print("True energy:", energy_tgt[:5].detach().cpu().numpy())
-            # print("Pred energy:", energy_pred[:5].detach().cpu().numpy())
-            # print()
 
         ######## Conditional flow matching (CFM) velocity loss (VE schedule). ########
         if need_cfm:
             if self.module_x.sde.kind != "ve":
                 raise ValueError("lambda_cfm is only implemented for coord_sde_kind='ve' (VE kinematics)")
-            assert pred_ligand is not None
+            assert pred_total is not None
             assert eps_x is not None
             assert zt_x is not None
             # Build target velocity in flow time t (0 noisy -> 1 clean).
@@ -1136,8 +1171,7 @@ class EnergyForceDiffusion(pl.LightningModule):
             d_sigma_dt = -sigma_tau * log_ratio
             v_target = d_sigma_dt[ligand["mask"]] * eps_x
 
-            # Flow-matching loss uses the dedicated FM force head if available.
-            force_pred = pred_ligand.get("force_fm", pred_ligand.get("force", pred_ligand.get("v", None)))
+            force_pred = pred_total.get("force", pred_total.get("v", None))
             if force_pred is None:
                 raise KeyError("Dynamics must return 'force_fm' or ('force'/'v')")
 
@@ -1174,6 +1208,8 @@ class EnergyForceDiffusion(pl.LightningModule):
         loss = (
             self.lambda_x * loss_x
             + self.lambda_h * loss_h
+            + self.lambda_force_dsm * loss_force_dsm
+            + self.lambda_energy_dsm * loss_energy_dsm
             + self.lambda_energy * loss_energy
             + float(getattr(self, "lambda_force_t0", 0.0)) * loss_force_t0
             + self.lambda_cfm * loss_cfm
@@ -1185,6 +1221,8 @@ class EnergyForceDiffusion(pl.LightningModule):
         info = {
             "loss_x": float(loss_x.mean().detach().cpu()),
             "loss_h": float(loss_h.mean().detach().cpu()),
+            "loss_force_dsm": float(loss_force_dsm.mean().detach().cpu()),
+            "loss_energy_dsm": float(loss_energy_dsm.mean().detach().cpu()),
             "loss_energy": float(loss_energy.mean().detach().cpu()),
             "loss_force_t0": float(loss_force_t0.mean().detach().cpu()),
             "loss_cfm": float(loss_cfm.mean().detach().cpu()),
@@ -1192,6 +1230,9 @@ class EnergyForceDiffusion(pl.LightningModule):
             "loss_consistency": float(loss_consistency.mean().detach().cpu()),
             "temperature": float(temp_val),
             "diffuse_h": bool(self.diffuse_h and (self.lambda_h is None or float(self.lambda_h) != 0.0)),
+            "phase_is_correction": float(1.0 if correction_active else 0.0),
+            "use_gamma_scaling": float(1.0 if self.use_gamma_scaling else 0.0),
+            "gamma_mean": float(pred_total["gamma_graph"].mean().detach().cpu()) if pred_total is not None else 1.0,
         }
 
         # Optional: log the (scheduled) t=0 fraction used for boundary losses.
@@ -1201,10 +1242,13 @@ class EnergyForceDiffusion(pl.LightningModule):
             if is_t0_graph is not None:
                 info["t0_batch_fraction_effective"] = float(is_t0_graph.float().mean().detach().cpu().item())
 
-        if self.log_diffusion_stats and (pred_ligand is not None) and (zt_x is not None):
+        if self.log_diffusion_stats and (pred_total is not None) and (zt_x is not None):
             with torch.no_grad():
                 sigma_b = self.module_x.sigma(1.0 - t.detach(), temperature=temperature).view(-1)
-                v = pred_ligand.get("force", pred_ligand.get("v")).detach()
+                v = pred_total.get("force", pred_total.get("v", None))
+                if v is None:
+                    raise RuntimeError("Internal error: total predictor must return 'force' or legacy 'v'")
+                v = v.detach()
                 v_norm = torch.sqrt(torch.sum(v * v, dim=-1) + 1e-12)
                 info.update(
                     {
@@ -1264,6 +1308,8 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.log("loss/train", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_x/train", info["loss_x"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_h/train", info["loss_h"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("loss_force_dsm/train", info["loss_force_dsm"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("loss_energy_dsm/train", info["loss_energy_dsm"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_energy/train", info["loss_energy"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_force_t0/train", info["loss_force_t0"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_cfm/train", info["loss_cfm"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
@@ -1276,6 +1322,8 @@ class EnergyForceDiffusion(pl.LightningModule):
             batch_size=len(batch["ligand"]["size"]),
         )
         self.log("temperature/train", info["temperature"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("phase_is_correction/train", info["phase_is_correction"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("gamma_mean/train", info["gamma_mean"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         if self.log_diffusion_stats:
             for k in (
                 "t/mean",
@@ -1300,6 +1348,8 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.log("loss/val", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_x/val", info["loss_x"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_h/val", info["loss_h"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("loss_force_dsm/val", info["loss_force_dsm"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("loss_energy_dsm/val", info["loss_energy_dsm"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_energy/val", info["loss_energy"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_force_t0/val", info["loss_force_t0"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_cfm/val", info["loss_cfm"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
@@ -1312,6 +1362,8 @@ class EnergyForceDiffusion(pl.LightningModule):
             batch_size=len(batch["ligand"]["size"]),
         )
         self.log("temperature/val", info["temperature"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("phase_is_correction/val", info["phase_is_correction"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("gamma_mean/val", info["gamma_mean"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         if self.log_diffusion_stats:
             for k in (
                 "t/mean",
@@ -1336,6 +1388,8 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.log("loss/test", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_x/test", info["loss_x"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_h/test", info["loss_h"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("loss_force_dsm/test", info["loss_force_dsm"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("loss_energy_dsm/test", info["loss_energy_dsm"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_energy/test", info["loss_energy"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_force_t0/test", info["loss_force_t0"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_cfm/test", info["loss_cfm"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
@@ -1348,6 +1402,8 @@ class EnergyForceDiffusion(pl.LightningModule):
             batch_size=len(batch["ligand"]["size"]),
         )
         self.log("temperature/test", info["temperature"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("phase_is_correction/test", info["phase_is_correction"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("gamma_mean/test", info["gamma_mean"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         return {"loss": loss, **info}
 
     @torch.no_grad()
@@ -1452,9 +1508,10 @@ class EnergyForceDiffusion(pl.LightningModule):
           num_nodes: int (fixed size) or tensor (n_samples,) with per-mol sizes
           timesteps: Euler steps from t=0 -> t=1 (denoising)
           temperature: scalar conditioning value (if None, uses config temperature)
-          x_sampler: 'ode' or 'sde'
-          h_sampler: 'markov_bridge' or 'score'
-          stochastic_x/h: only used when sampler uses stochastic steps
+                    x_sampler: 'ode' for velocity integration using the force head, or 'sde'
+                        for reverse diffusion using the score induced by the energy head.
+                    h_sampler: 'markov_bridge' or 'score'
+                    stochastic_x/h: only used when the corresponding sampler uses stochastic steps
         """
         assert x_sampler in {"ode", "sde"}
         assert h_sampler in {"markov_bridge", "score"}
@@ -1507,6 +1564,8 @@ class EnergyForceDiffusion(pl.LightningModule):
                 h = self.module_h_score.logits_to_probs(h_logits)
 
         dt = 1.0 / float(timesteps)
+        target_s = float(getattr(self, "target_sigma", 1.0))
+        correction_active = self._phase_name_for_epoch() == "correction"
         for i in range(timesteps):
             # Denoising integration in flow time: start at s=0 and step up to t=1.
             s_val = i * dt
@@ -1514,34 +1573,58 @@ class EnergyForceDiffusion(pl.LightningModule):
             s = torch.full((n_samples, 1), s_val, device=device, dtype=dtype)
             t = torch.full((n_samples, 1), t_val, device=device, dtype=dtype)
 
-            pred_ligand, _ = self.dynamics(
-                x,
-                h,
-                batch_mask,
-                pocket=None,
-                t=s,
-                temperature=t_temperature,
-                bonds_ligand=None,
-                sc_transform=None,
-            )
+            if x_sampler == "ode":
+                _, _, pred_total = self._forward_model_components(
+                    x,
+                    h,
+                    batch_mask,
+                    s,
+                    temperature=t_temperature,
+                    correction_active=correction_active,
+                )
 
-            # Coordinates (flow matching): explicit Euler integration dx/dt = v(x,t).
-            # Convert predicted force F into velocity using: v = f + 0.5 * g^2 * F.
-            step = (t - s)[batch_mask]
-            F = pred_ligand.get("force", pred_ligand.get("v", None))
-            if F is None:
-                raise KeyError("Dynamics must return 'force' (preferred) or legacy 'v'")
-            
-            # Model is trained in scaled units; undo scaling for diffusion integration to physical space.
-            target_s = float(getattr(self, "target_sigma", 1.0))
-            F = F * target_s
+                # Coordinates (flow matching): explicit Euler integration dx/dt = v(x,t).
+                # Convert predicted force F into velocity using: v = f + 0.5 * g^2 * F.
+                step = (t - s)[batch_mask]
+                F = pred_total.get("force", pred_total.get("v", None))
+                if F is None:
+                    raise KeyError("Dynamics must return 'force' (preferred) or legacy 'v'")
 
-            s_tau = 1.0 - s
-            f = self.module_x._sde_f_forward(x, s_tau, batch_mask, temperature=sampler_temperature).to(dtype=x.dtype)
-            g2 = self.module_x._sde_g2_forward(s_tau, temperature=sampler_temperature)  # (B,)
-            g2_node = g2[batch_mask].unsqueeze(-1).to(dtype=x.dtype)
-            v = f + 0.5 * g2_node * F.to(dtype=x.dtype) 
-            x = x + step * v
+                # Model is trained in scaled units; undo scaling for diffusion integration to physical space.
+                F = utils.unscale_target(F.to(dtype=x.dtype), target_s)
+
+                s_tau = 1.0 - s
+                f = self.module_x._sde_f_forward(x, s_tau, batch_mask, temperature=sampler_temperature).to(dtype=x.dtype)
+                g2 = self.module_x._sde_g2_forward(s_tau, temperature=sampler_temperature)  # (B,)
+                g2_node = g2[batch_mask].unsqueeze(-1).to(dtype=x.dtype)
+                v = f + 0.5 * g2_node * F
+                x = x + step * v
+            else:
+                # Reverse diffusion sampling uses the predicted force/score field directly.
+                _, _, pred_total = self._forward_model_components(
+                    x,
+                    h,
+                    batch_mask,
+                    s,
+                    temperature=t_temperature,
+                    correction_active=correction_active,
+                )
+                score_s = pred_total.get("force", pred_total.get("v", None))
+                if score_s is None:
+                    raise KeyError("Dynamics must return 'force' (preferred) or legacy 'v'")
+
+                score_s = utils.unscale_target(score_s.to(dtype=x.dtype), target_s)
+                s_tau = 1.0 - s
+                t_tau = 1.0 - t
+                x = self.module_x.reverse_step(
+                    x,
+                    score_s,
+                    s=s_tau,
+                    t=t_tau,
+                    batch_mask=batch_mask,
+                    temperature=sampler_temperature,
+                    stochastic=stochastic_x,
+                )
 
             # Enforce translation invariance (match training which centers per molecule).
             # IMPORTANT: for toy settings (e.g., 1-node graphs learning an absolute-position
@@ -1558,7 +1641,7 @@ class EnergyForceDiffusion(pl.LightningModule):
                     t_mb = t
                     h = self.module_h.sample_zt_given_zs(
                         h,
-                        pred_ligand["logits_h"],
+                        pred_total["logits_h"],
                         s=s_mb,
                         t=t_mb,
                         batch_mask=batch_mask,
@@ -1570,10 +1653,10 @@ class EnergyForceDiffusion(pl.LightningModule):
                     # tau=0 clean -> tau=1 most noisy, so we use tau = 1 - t (flow time).
                     s_tau = 1.0 - s
                     t_tau = 1.0 - t
-                    if x_sampler == "ode":
+                    if not stochastic_h:
                         h_logits = self.module_h_score.ode_step(
                             h_logits,
-                            pred_ligand["logits_h"],
+                            pred_total["logits_h"],
                             s=s_tau,
                             t=t_tau,
                             batch_mask=batch_mask,
@@ -1582,7 +1665,7 @@ class EnergyForceDiffusion(pl.LightningModule):
                     else:
                         h_logits = self.module_h_score.reverse_step(
                             h_logits,
-                            pred_ligand["logits_h"],
+                            pred_total["logits_h"],
                             s=s_tau,
                             t=t_tau,
                             batch_mask=batch_mask,

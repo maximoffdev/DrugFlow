@@ -968,7 +968,8 @@ class CoordScoreDiffusion:
     
     def hjb_loss(
         self,
-        force_pred: torch.Tensor,
+        force_hjb: torch.Tensor,
+        force_consistency: torch.Tensor,
         energy_pred: torch.Tensor,
         x: torch.Tensor,
         t: torch.Tensor,
@@ -988,10 +989,14 @@ class CoordScoreDiffusion:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute force-based HJB residual loss + force/energy consistency.
 
-        This matches the older force-formalism implementation:
-          - HJB residual is computed in diffusion forward-time tau (tau=0 clean).
-          - The network is evaluated at flow time t, with tau = 1 - t.
-          - Consistency is mean squared (F + ∇_x u) per example.
+                Time convention:
+                    - flow time t runs from 0 (noisy) to 1 (clean)
+                    - diffusion forward time tau = 1 - t
+
+                Implemented residual:
+                    dE/dt + 0.5 * g(tau)^2 * (||F||^2 - div(F)) = 0
+
+                Consistency is mean squared (F_consistency + ∇_x E_consistency) per example.
         """
         assert reduce in {"mean", "sum", "none"}
 
@@ -1014,9 +1019,12 @@ class CoordScoreDiffusion:
             empty = torch.empty((0,), device=x.device, dtype=x.dtype)
             return empty, empty
 
-        F_pred = force_pred
+        F_hjb = force_hjb
         if self.project_predicted_score_zero_com:
-            F_pred = self._project_zero_com(F_pred, batch_mask)
+            F_hjb = self._project_zero_com(F_hjb, batch_mask)
+        F_consistency = force_consistency
+        if self.project_predicted_score_zero_com:
+            F_consistency = self._project_zero_com(F_consistency, batch_mask)
         u_pred = energy_pred.view(-1)
         if u_pred.numel() != B:
             raise ValueError(f"energy_pred must have shape (B,), got {tuple(energy_pred.shape)}")
@@ -1043,7 +1051,7 @@ class CoordScoreDiffusion:
                 retain_graph=True,
                 allow_unused=False,
             )[0]
-            du_dt = -du_dt.view(-1)  # du/dtau via chain rule (tau = 1 - t)
+            du_dt = -du_dt.view(-1)
 
             if compute_consistency and (du_dx is None):
                 du_dx = torch.autograd.grad(
@@ -1059,7 +1067,7 @@ class CoordScoreDiffusion:
                 for i in range(x.size(-1)):
                     retain = True if create_graph else (i < x.size(-1) - 1)
                     grad_Fi = torch.autograd.grad(
-                        outputs=F_pred[:, i].sum(),
+                        outputs=F_hjb[:, i].sum(),
                         inputs=x,
                         create_graph=div_create_graph,
                         retain_graph=retain,
@@ -1094,7 +1102,7 @@ class CoordScoreDiffusion:
                     v = _rademacher_antithetic(this_bs)
                     try:
                         Jt_v = torch.autograd.grad(
-                            outputs=F_pred,
+                            outputs=F_hjb,
                             inputs=x,
                             grad_outputs=v,
                             create_graph=div_create_graph,
@@ -1109,7 +1117,7 @@ class CoordScoreDiffusion:
                             v_s = v[s_idx]
                             retain = True if create_graph else (remaining > 0 or s_idx < this_bs - 1)
                             Jt_v_s = torch.autograd.grad(
-                                outputs=F_pred,
+                                outputs=F_hjb,
                                 inputs=x,
                                 grad_outputs=v_s,
                                 create_graph=div_create_graph,
@@ -1127,23 +1135,20 @@ class CoordScoreDiffusion:
             du_dt = torch.zeros((B,), device=x.device, dtype=x.dtype)
             div_F = torch.zeros((B,), device=x.device, dtype=x.dtype)
 
-        temp_denom = torch.clamp(temperature_t.view(-1), min=1e-6)
-
         g2 = self._sde_g2_forward(tau, temperature=temperature_t)
-        f_node = self._sde_f_forward(x, tau, batch_mask, temperature=temperature_t)
-        F_dot_f = scatter_add(torch.sum(F_pred * f_node, dim=-1), batch_mask, dim=0)
-        div_f = self._sde_div_f_forward(x, tau, batch_mask, temperature=temperature_t)
-        F_norm2 = scatter_add(torch.sum(F_pred * F_pred, dim=-1), batch_mask, dim=0)
+        F_norm2 = scatter_add(torch.sum(F_hjb * F_hjb, dim=-1), batch_mask, dim=0)
 
         if compute_hjb:
             hjb_residual = (
                 du_dt
-                - F_dot_f
-                + 0.5 * g2 * F_norm2 / temp_denom
-                - div_f
-                + 0.5 * g2 * div_F / temp_denom
+                # - F_dot_f
+                + 0.5 * g2 * F_norm2 #/ temp_denom
+                # - div_f
+                + 0.5 * g2 * div_F #/ temp_denom
             )
+            # hjb_residual = du_dt + 0.5 * g2 * (F_norm2 - div_F)
             loss_hjb = hjb_residual * hjb_residual
+
         else:
             loss_hjb = torch.zeros((B,), device=x.device, dtype=x.dtype)
 
@@ -1159,12 +1164,13 @@ class CoordScoreDiffusion:
             else:
                 if du_dx.shape != x.shape:
                     raise ValueError(f"du_dx must have shape {tuple(x.shape)}; got {tuple(du_dx.shape)}")
-            per_node_cons = torch.mean((F_pred + du_dx) ** 2, dim=-1)
+            per_node_cons = torch.mean((F_consistency + du_dx) ** 2, dim=-1)
             loss_consistency = scatter_mean(per_node_cons, batch_mask, dim=0)
         else:
             loss_consistency = torch.zeros((B,), device=x.device, dtype=x.dtype)
 
         if debug:
+            du_dx_mean = float("nan") if du_dx is None else float(du_dx.mean())
             mem_str = ""
             if x.is_cuda and torch.cuda.is_available():
                 try:
@@ -1190,12 +1196,11 @@ class CoordScoreDiffusion:
             )
             status_msg = (
                 f"du_dt: {du_dt.mean():.4f} | "
-                f"F_dot_f: {F_dot_f.mean():.4f} | "
-                f"Term3: {torch.mean(0.5 * g2 * F_norm2 / temp_denom):.4f} | "
-                f"div_f: {div_f.mean():.4f} | "
-                f"Term5: {torch.mean(0.5 * g2 * div_F / temp_denom):.4f} |"
-                f"dU/dx: {du_dx.mean():.4f} | "
-                f"F_pred: {F_pred.mean():.4f} | "
+                f"Term_force: {torch.mean(0.5 * g2 * F_norm2):.4f} | "
+                f"Term_div: {torch.mean(0.5 * g2 * div_F):.4f} |"
+                f"dU/dx: {du_dx_mean:.4f} | "
+                f"F_hjb: {F_hjb.mean():.4f} | "
+                f"F_consistency: {F_consistency.mean():.4f} | "
                 f"HJB Loss: {loss_hjb.mean():.4f} | "
                 f"Consistency Loss: {loss_consistency.mean():.4f} | "
                 f"{mem_str}"

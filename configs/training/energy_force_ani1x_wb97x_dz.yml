@@ -23,6 +23,7 @@ train_params:
   accumulate_grad_batches: 2
   lr: 5.0e-4
   n_epochs: 500
+  pretrain_diff_epochs: 100
   num_workers: 0
   gpus: 1
   clip_grad: True
@@ -57,22 +58,28 @@ wandb_params:
 loss_params:
   discrete_loss: CE  # CE or VLB
 
-  # Loss weights
+  # Phase 1: diffusion-base pretraining on noisy samples.
+  lambda_force_dsm: 1.0
+  lambda_energy_dsm: 1.0
+
+  # Toggle the pretrained-base gamma fade-out envelope on or off.
+  use_gamma_scaling: True
+
+  # Base fade-out envelope: gamma = sigma^2 / (sigma^2 + gamma_envelope_eps).
+  gamma_envelope_eps: 0.01
+
+  # Optional legacy flow-matching loss; kept disabled for the two-phase setup.
   lambda_cfm: 0.0
   cfm_weight_by_snr: True
   cfm_use_min_snr: True
   cfm_min_snr_gamma: 5.0
 
   lambda_h: 0.0
-  lambda_energy: 1.0
 
-  lambda_hjb: 0.0
+  # Phase 2: correction-model training.
+  lambda_energy: 1.0
+  lambda_hjb: 1.0
   lambda_consistency: 1.0
-  # Toggle the FM component used inside HJB/consistency:
-  #   False -> use the model-predicted FM force
-  #   True  -> use the target-derived FM force
-  # The correction term still comes from the model and retains its time interpolation.
-  hjb_use_target_force_fm: False
 
   # Boundary condition at the clean endpoint (flow-time t≈1): match forces via force_pred = -dE/dx.
   # NOTE: Flag name is legacy (`*_t0`). Under the current convention t=0 is most noisy and t=1 is clean.
@@ -137,11 +144,11 @@ predictor_params:
   condition_temperature: False  # ignored; temperature conditioning follows simulation_params.use_temperature
 
   # Scale the two force heads (set to 0.0 to disable one component).
-  force_fm_scale: 1.0
-  force_corr_scale: 1.0
+  # force_fm_scale: 1.0
+  # force_corr_scale: 1.0
   
-  # Fades in F_corr over flow time t: F = F_FM + t * F_corr
-  force_corr_schedule: True
+  # # Fades in F_corr over flow time t: F = F_FM + t * F_corr
+  # force_corr_schedule: True
   
   # Radius graph construction (ligand-only)
   edge_cutoff_ligand: 50.0
