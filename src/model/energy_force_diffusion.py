@@ -1351,12 +1351,32 @@ class EnergyForceDiffusion(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, *args):
-        loss, info = self.compute_loss(
-            batch["ligand"],
-            energy=batch.get("energy", None),
-            force=batch.get("force", None),
-            return_info=True,
+        needs_eval_grad = (
+            float(self.lambda_x) > 0.0
+            or float(self.lambda_energy_dsm) > 0.0
+            or float(self.lambda_cfm) > 0.0
+            or (
+                self._phase_name_for_epoch() == "correction"
+                and (float(self.lambda_hjb) > 0.0 or float(self.lambda_consistency) > 0.0)
+            )
         )
+
+        eval_ctx = nullcontext()
+        if needs_eval_grad:
+            eval_stack = ExitStack()
+            if torch.is_inference_mode_enabled():
+                eval_stack.enter_context(torch.inference_mode(False))
+            if not torch.is_grad_enabled():
+                eval_stack.enter_context(torch.enable_grad())
+            eval_ctx = eval_stack
+
+        with eval_ctx:
+            loss, info = self.compute_loss(
+                batch["ligand"],
+                energy=batch.get("energy", None),
+                force=batch.get("force", None),
+                return_info=True,
+            )
         self.log("loss/val", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_x/val", info["loss_x"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_h/val", info["loss_h"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
@@ -1391,12 +1411,32 @@ class EnergyForceDiffusion(pl.LightningModule):
         return {"loss": loss, **info}
 
     def test_step(self, batch, *args):
-        loss, info = self.compute_loss(
-            batch["ligand"],
-            energy=batch.get("energy", None),
-            force=batch.get("force", None),
-            return_info=True,
+        needs_eval_grad = (
+            float(self.lambda_x) > 0.0
+            or float(self.lambda_energy_dsm) > 0.0
+            or float(self.lambda_cfm) > 0.0
+            or (
+                self._phase_name_for_epoch() == "correction"
+                and (float(self.lambda_hjb) > 0.0 or float(self.lambda_consistency) > 0.0)
+            )
         )
+
+        eval_ctx = nullcontext()
+        if needs_eval_grad:
+            eval_stack = ExitStack()
+            if torch.is_inference_mode_enabled():
+                eval_stack.enter_context(torch.inference_mode(False))
+            if not torch.is_grad_enabled():
+                eval_stack.enter_context(torch.enable_grad())
+            eval_ctx = eval_stack
+
+        with eval_ctx:
+            loss, info = self.compute_loss(
+                batch["ligand"],
+                energy=batch.get("energy", None),
+                force=batch.get("force", None),
+                return_info=True,
+            )
         self.log("loss/test", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_x/test", info["loss_x"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("loss_h/test", info["loss_h"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
