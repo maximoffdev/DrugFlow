@@ -8,7 +8,7 @@ from typing import Literal, cast
 from pathlib import Path
 from typing import Optional, Union
 import warnings
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 
 import numpy as np
 import pytorch_lightning as pl
@@ -962,8 +962,20 @@ class EnergyForceDiffusion(pl.LightningModule):
         hjb_debug = bool(self.hjb_debug and self.training)
 
         grad_ctx = nullcontext()
-        if need_time_space_grads and (not torch.is_grad_enabled()):
-            grad_ctx = torch.enable_grad()
+        if need_time_space_grads:
+            grad_contexts = []
+            if torch.is_inference_mode_enabled():
+                grad_contexts.append(torch.inference_mode(False))
+            if not torch.is_grad_enabled():
+                grad_contexts.append(torch.enable_grad())
+
+            if len(grad_contexts) == 1:
+                grad_ctx = grad_contexts[0]
+            elif len(grad_contexts) > 1:
+                grad_stack = ExitStack()
+                for ctx in grad_contexts:
+                    grad_stack.enter_context(ctx)
+                grad_ctx = grad_stack
 
         if need_main_pass:
             assert zt_x is not None
