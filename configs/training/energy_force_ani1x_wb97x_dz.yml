@@ -19,11 +19,11 @@ train_params:
   enable_progress_bar: True
   num_sanity_val_steps: 0
 
-  batch_size: 32
+  batch_size: 4
   accumulate_grad_batches: 2
   lr: 5.0e-4
   n_epochs: 5
-  pretrain_diff_epochs: 2
+  pretrain_diff_epochs: 0
   num_workers: 0
   gpus: 1
   clip_grad: True
@@ -48,7 +48,7 @@ train_params:
   pkl_split_seed: 42
 
   # Optional: limit files for debugging, for full dataset use null
-  pkl_file_limit: 1000 # null
+  pkl_file_limit: null
 
 wandb_params:
   mode: offline  # disabled, offline, online

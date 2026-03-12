@@ -127,7 +127,7 @@ class RadiusGVPDynamics(nn.Module):
             nn.Linear(2 * params.hidden_scalar_nf, self.atom_nf),
         )
 
-        ef_in_dim = 2 * params.hidden_scalar_nf + self.x_dim
+        ef_in_dim = params.hidden_scalar_nf + self.x_dim
         self.energy_node_head = nn.Sequential(
             nn.Linear(ef_in_dim, params.hidden_scalar_nf),
             nn.SiLU(),
