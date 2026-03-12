@@ -22,12 +22,12 @@ train_params:
   batch_size: 32
   accumulate_grad_batches: 2
   lr: 5.0e-4
-  n_epochs: 500
-  pretrain_diff_epochs: 100
+  n_epochs: 5
+  pretrain_diff_epochs: 2
   num_workers: 0
   gpus: 1
   clip_grad: True
-  gradient_clip_val: 1.0
+  gradient_clip_val: 10.0
 
   # Debugging: log t/sigma/score statistics to WandB.
   log_diffusion_stats: False
@@ -48,7 +48,7 @@ train_params:
   pkl_split_seed: 42
 
   # Optional: limit files for debugging, for full dataset use null
-  pkl_file_limit: null
+  pkl_file_limit: 1000 # null
 
 wandb_params:
   mode: offline  # disabled, offline, online
@@ -63,7 +63,7 @@ loss_params:
   lambda_energy_dsm: 1.0
 
   # Toggle the pretrained-base gamma fade-out envelope on or off.
-  use_gamma_scaling: True
+  use_gamma_scaling: False
 
   # Base fade-out envelope: gamma = sigma^2 / (sigma^2 + gamma_envelope_eps).
   gamma_envelope_eps: 0.01
@@ -89,7 +89,7 @@ loss_params:
   # Fraction of graphs in each batch forced to the clean endpoint (t≈1) for boundary energy/force losses.
   # The remaining graphs keep their sampled diffusion time.
   # Using a smaller fraction reduces the cost of the autograd force term.
-  t0_batch_fraction: 0.9
+  t0_batch_fraction: 0.2
 
   # Use epsilon time instead of exact t=1 for the boundary subset (coordinates are still kept clean).
   # Set to 0.0 to recover exact t=1 conditioning.
@@ -110,7 +110,7 @@ simulation_params:
 
   # Optional per-epoch time-horizon curriculum (mirrors notebooks/test.ipynb).
   # When enabled, sample t ~ Uniform([t_min, t_max_epoch]) with sinusoidal growth.
-  time_horizon_schedule: sinusoidal  # constant | sinusoidal
+  time_horizon_schedule: constant  # constant | sinusoidal
   time_horizon_warmup_fraction: 0.1
   time_horizon_plateau_start_fraction: 0.5
   time_horizon_t_min: 0.01

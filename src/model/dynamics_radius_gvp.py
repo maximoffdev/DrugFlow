@@ -46,9 +46,9 @@ class RadiusGVPParams:
     num_rbf: int = 16
 
     # Force head scaling
-    # force_fm_scale: float = 1.0
-    # force_corr_scale: float = 1.0
-    # force_corr_schedule: bool = False
+    force_fm_scale: float = 1.0
+    force_corr_scale: float = 1.0
+    force_corr_schedule: bool = False
 
 
 class RadiusGVPDynamics(nn.Module):
