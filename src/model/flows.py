@@ -1051,7 +1051,7 @@ class CoordScoreDiffusion:
                 retain_graph=True,
                 allow_unused=False,
             )[0]
-            du_dt = -du_dt.view(-1)
+            du_dt = -du_dt.view(-1) # Negative sign because tau=1-t, so du/dt = -du/dtau.
 
             if compute_consistency and (du_dx is None):
                 du_dx = torch.autograd.grad(
