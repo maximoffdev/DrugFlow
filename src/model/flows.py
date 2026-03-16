@@ -969,13 +969,11 @@ class CoordScoreDiffusion:
     def hjb_loss(
         self,
         force_hjb: torch.Tensor,
-        force_consistency: torch.Tensor,
         energy_pred: torch.Tensor,
         x: torch.Tensor,
         t: torch.Tensor,
         batch_mask: torch.Tensor,
         *,
-        du_dx: torch.Tensor | None = None,
         temperature: torch.Tensor | float | None = None,
         reduce: str = "mean",
         divergence: Literal["exact", "hutchinson"] = "hutchinson",
@@ -984,19 +982,16 @@ class CoordScoreDiffusion:
         enable_higher_order: bool = True,
         divergence_create_graph: bool | None = None,
         compute_hjb: bool = True,
-        compute_consistency: bool = True,
         debug: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute force-based HJB residual loss + force/energy consistency.
+    ) -> torch.Tensor:
+        """Compute the force-based HJB residual loss.
 
                 Time convention:
                     - flow time t runs from 0 (noisy) to 1 (clean)
                     - diffusion forward time tau = 1 - t
 
                 Implemented residual:
-                    dE/dt + 0.5 * g(tau)^2 * (||F||^2 - div(F)) = 0
-
-                Consistency is mean squared (F_consistency + ∇_x E_consistency) per example.
+                    dE/dt + 0.5 * g(tau)^2 * (||F||^2 + div(F)) = 0
         """
         assert reduce in {"mean", "sum", "none"}
 
@@ -1016,15 +1011,11 @@ class CoordScoreDiffusion:
 
         B = int(batch_mask.max().item()) + 1 if batch_mask.numel() > 0 else 0
         if B == 0:
-            empty = torch.empty((0,), device=x.device, dtype=x.dtype)
-            return empty, empty
+            return torch.empty((0,), device=x.device, dtype=x.dtype)
 
         F_hjb = force_hjb
         if self.project_predicted_score_zero_com:
             F_hjb = self._project_zero_com(F_hjb, batch_mask)
-        F_consistency = force_consistency
-        if self.project_predicted_score_zero_com:
-            F_consistency = self._project_zero_com(F_consistency, batch_mask)
         u_pred = energy_pred.view(-1)
         if u_pred.numel() != B:
             raise ValueError(f"energy_pred must have shape (B,), got {tuple(energy_pred.shape)}")
@@ -1052,15 +1043,6 @@ class CoordScoreDiffusion:
                 allow_unused=False,
             )[0]
             du_dt = -du_dt.view(-1) # Negative sign because tau=1-t, so du/dt = -du/dtau.
-
-            if compute_consistency and (du_dx is None):
-                du_dx = torch.autograd.grad(
-                    outputs=u_pred.sum(),
-                    inputs=x,
-                    create_graph=create_graph,
-                    retain_graph=True,
-                    allow_unused=False,
-                )[0]
 
             if divergence == "exact":
                 div_F_node = torch.zeros((x.size(0),), device=x.device, dtype=x.dtype)
@@ -1146,31 +1128,12 @@ class CoordScoreDiffusion:
                 # - div_f
                 + 0.5 * g2 * div_F #/ temp_denom
             )
-            # hjb_residual = du_dt + 0.5 * g2 * (F_norm2 - div_F)
             loss_hjb = hjb_residual * hjb_residual
 
         else:
             loss_hjb = torch.zeros((B,), device=x.device, dtype=x.dtype)
 
-        if compute_consistency:
-            if du_dx is None:
-                du_dx = torch.autograd.grad(
-                    outputs=u_pred.sum(),
-                    inputs=x,
-                    create_graph=create_graph,
-                    retain_graph=True if create_graph else False,
-                    allow_unused=False,
-                )[0]
-            else:
-                if du_dx.shape != x.shape:
-                    raise ValueError(f"du_dx must have shape {tuple(x.shape)}; got {tuple(du_dx.shape)}")
-            per_node_cons = torch.mean((F_consistency + du_dx) ** 2, dim=-1)
-            loss_consistency = scatter_mean(per_node_cons, batch_mask, dim=0)
-        else:
-            loss_consistency = torch.zeros((B,), device=x.device, dtype=x.dtype)
-
         if debug:
-            du_dx_mean = float("nan") if du_dx is None else float(du_dx.mean())
             mem_str = ""
             if x.is_cuda and torch.cuda.is_available():
                 try:
@@ -1198,21 +1161,18 @@ class CoordScoreDiffusion:
                 f"du_dt: {du_dt.mean():.4f} | "
                 f"Term_force: {torch.mean(0.5 * g2 * F_norm2):.4f} | "
                 f"Term_div: {torch.mean(0.5 * g2 * div_F):.4f} |"
-                f"dU/dx: {du_dx_mean:.4f} | "
                 f"F_hjb: {F_hjb.mean():.4f} | "
-                f"F_consistency: {F_consistency.mean():.4f} | "
                 f"HJB Loss: {loss_hjb.mean():.4f} | "
-                f"Consistency Loss: {loss_consistency.mean():.4f} | "
                 f"{mem_str}"
                 f"{flag_str}"
             )
             print(status_msg, end="\r")
 
-        # NOTE: `loss_hjb` and `loss_consistency` are already aggregated per example (shape: (B,)).
+        # NOTE: `loss_hjb` is already aggregated per example (shape: (B,)).
         # The `reduce` flag in this codebase typically refers to reducing *node-level* losses
         # to per-example losses using `batch_mask`. Applying `reduce_loss` here would attempt
         # to scatter-reduce a (B,) tensor with an (N,) index, causing shape mismatches.
-        return loss_hjb, loss_consistency
+        return loss_hjb
 
 
     def reverse_step(

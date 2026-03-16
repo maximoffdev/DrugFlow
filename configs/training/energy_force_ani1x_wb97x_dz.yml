@@ -50,6 +50,12 @@ train_params:
   # Optional: limit files for debugging, for full dataset use null
   pkl_file_limit: null
 
+  # Convert supervised DFT energies/forces into reduced thermodynamic units U/(k_B T_ref)
+  # and F/(k_B T_ref). This leaves DSM score targets and sampler equations unchanged while
+  # making the supervised targets score-compatible.
+  use_reduced_thermo_units: True
+  thermo_reference_temperature_K: 300.0
+
 wandb_params:
   mode: offline  # disabled, offline, online
   entity:
@@ -85,6 +91,9 @@ loss_params:
   # NOTE: Flag name is legacy (`*_t0`). Under the current convention t=0 is most noisy and t=1 is clean.
   # (Set to 0.0 to disable.)
   lambda_force_t0: 1.0
+
+  # Additional clean-endpoint force supervision using the energy gradient directly: target force vs -dU/dx.
+  lambda_force_energy_t0: 1.0
 
   # Fraction of graphs in each batch forced to the clean endpoint (t≈1) for boundary energy/force losses.
   # The remaining graphs keep their sampled diffusion time.
