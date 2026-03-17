@@ -132,9 +132,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.target_sigma, self.omol_elem_ref = utils.parse_dataset_stats(getattr(train_params, "dataset_stats", None))
 
         # Optional reduced thermodynamic target units for DFT supervision.
-        # When enabled, DFT energies/forces are converted to reduced units by dividing by k_B T_ref,
-        # and the shared target sigma is converted to the same reduced-unit scale so that the model's
-        # internal scaled representation remains consistent across energy/force gradients and sampling.
+        # When enabled, DFT energies/forces are converted to reduced units by dividing by k_B T_ref.
         set_default(train_params, "use_reduced_thermo_units", False)
         set_default(train_params, "thermo_reference_temperature_K", 300.0)
         self.use_reduced_thermo_units = bool(getattr(train_params, "use_reduced_thermo_units", False))
@@ -151,12 +149,8 @@ class EnergyForceDiffusion(pl.LightningModule):
                     "Computed k_B T_ref must be a positive finite float; got "
                     f"{self.thermo_kbt_ev} eV from T_ref={self.thermo_reference_temperature_K} K"
                 )
-            self.target_sigma_model = float(self.target_sigma) / float(self.thermo_kbt_ev)
         else:
             self.thermo_kbt_ev = 1.0
-            self.target_sigma_model = float(self.target_sigma)
-        if not np.isfinite(self.target_sigma_model) or self.target_sigma_model <= 0.0:
-            raise ValueError(f"Effective target sigma must be a positive finite float, got {self.target_sigma_model}")
 
         # Loss params
         self.loss_reduce = loss_params.reduce
@@ -487,9 +481,6 @@ class EnergyForceDiffusion(pl.LightningModule):
         if not self.use_reduced_thermo_units:
             return x
         return x / float(self.thermo_kbt_ev)
-
-    def _scale_supervised_target(self, x: torch.Tensor) -> torch.Tensor:
-        return utils.scale_target(x, float(self.target_sigma_model))
 
     def _combine_predictions(
         self,
@@ -1180,9 +1171,6 @@ class EnergyForceDiffusion(pl.LightningModule):
 
                     energy_tgt = self._convert_physical_targets_to_model_units(energy_tgt)
 
-                    # Target scaling: x_scaled = x / sigma (mu=0).
-                    energy_tgt = self._scale_supervised_target(energy_tgt)
-
                     loss_energy = torch.abs(energy_pred - energy_tgt)
                     loss_energy = loss_energy * is_t0_graph.to(dtype=loss_energy.dtype)
 
@@ -1198,9 +1186,6 @@ class EnergyForceDiffusion(pl.LightningModule):
                         )
 
                     force_tgt = self._convert_physical_targets_to_model_units(force_tgt)
-
-                    # Target scaling: x_scaled = x / sigma (mu=0).
-                    force_tgt = self._scale_supervised_target(force_tgt)
 
                     is_t0_node = is_t0_graph[ligand["mask"]]
                     per_node = torch.mean((force_pred.to(dtype=ligand["x"].dtype) - force_tgt) ** 2, dim=-1)
@@ -1227,9 +1212,6 @@ class EnergyForceDiffusion(pl.LightningModule):
                         )
 
                     force_tgt = self._convert_physical_targets_to_model_units(force_tgt)
-
-                    # Target scaling: x_scaled = x / sigma (mu=0).
-                    force_tgt = self._scale_supervised_target(force_tgt)
 
                     is_t0_node = is_t0_graph[ligand["mask"]]
                     per_node = torch.mean(((-grad_energy_total) - force_tgt) ** 2, dim=-1)
@@ -1265,10 +1247,8 @@ class EnergyForceDiffusion(pl.LightningModule):
             if force_pred is None:
                 raise KeyError("Dynamics must return 'force_fm' or ('force'/'v')")
 
-            # Unscale the network's force prediction into the model's integration units.
-            # With reduced thermo units enabled this is a score-like field in reduced units.
-            target_s = float(self.target_sigma_model)
-            force_pred_model = force_pred.to(dtype=ligand["x"].dtype) * target_s
+            # The model field is already represented in reduced score/force units.
+            force_pred_model = force_pred.to(dtype=ligand["x"].dtype)
 
             # Velocity for flow-matching loss is computed directly from predicted force:
             #   v = f + 0.5 * g^2 * F
@@ -1329,7 +1309,6 @@ class EnergyForceDiffusion(pl.LightningModule):
             "use_reduced_thermo_units": float(1.0 if self.use_reduced_thermo_units else 0.0),
             "thermo_reference_temperature_K": float(self.thermo_reference_temperature_K),
             "thermo_kbt_ev": float(self.thermo_kbt_ev),
-            "target_sigma_model": float(self.target_sigma_model),
         }
 
         # Optional: log the (scheduled) t=0 fraction used for boundary losses.
@@ -1425,7 +1404,6 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.log("use_reduced_thermo_units/train", info["use_reduced_thermo_units"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("thermo_reference_temperature_K/train", info["thermo_reference_temperature_K"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("thermo_kbt_ev/train", info["thermo_kbt_ev"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
-        self.log("target_sigma_model/train", info["target_sigma_model"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         if self.log_diffusion_stats:
             for k in (
                 "t/mean",
@@ -1494,7 +1472,6 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.log("use_reduced_thermo_units/val", info["use_reduced_thermo_units"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("thermo_reference_temperature_K/val", info["thermo_reference_temperature_K"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("thermo_kbt_ev/val", info["thermo_kbt_ev"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
-        self.log("target_sigma_model/val", info["target_sigma_model"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         if self.log_diffusion_stats:
             for k in (
                 "t/mean",
@@ -1563,7 +1540,6 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.log("use_reduced_thermo_units/test", info["use_reduced_thermo_units"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("thermo_reference_temperature_K/test", info["thermo_reference_temperature_K"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("thermo_kbt_ev/test", info["thermo_kbt_ev"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
-        self.log("target_sigma_model/test", info["target_sigma_model"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         return {"loss": loss, **info}
 
     @torch.no_grad()
@@ -1724,7 +1700,6 @@ class EnergyForceDiffusion(pl.LightningModule):
                 h = self.module_h_score.logits_to_probs(h_logits)
 
         dt = 1.0 / float(timesteps)
-        target_s = float(self.target_sigma_model)
         correction_active = self._phase_name_for_epoch() == "correction"
         for i in range(timesteps):
             # Denoising integration in flow time: start at s=0 and step up to t=1.
@@ -1750,8 +1725,8 @@ class EnergyForceDiffusion(pl.LightningModule):
                 if F is None:
                     raise KeyError("Dynamics must return 'force' (preferred) or legacy 'v'")
 
-                # Model is trained in scaled units; undo scaling for diffusion integration to physical space.
-                F = utils.unscale_target(F.to(dtype=x.dtype), target_s)
+                # The model field is already represented in reduced score/force units.
+                F = F.to(dtype=x.dtype)
 
                 s_tau = 1.0 - s
                 f = self.module_x._sde_f_forward(x, s_tau, batch_mask, temperature=sampler_temperature).to(dtype=x.dtype)
@@ -1773,7 +1748,7 @@ class EnergyForceDiffusion(pl.LightningModule):
                 if score_s is None:
                     raise KeyError("Dynamics must return 'force' (preferred) or legacy 'v'")
 
-                score_s = utils.unscale_target(score_s.to(dtype=x.dtype), target_s)
+                score_s = score_s.to(dtype=x.dtype)
                 s_tau = 1.0 - s
                 t_tau = 1.0 - t
                 x = self.module_x.reverse_step(
