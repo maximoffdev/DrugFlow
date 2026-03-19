@@ -1124,9 +1124,9 @@ class CoordScoreDiffusion:
             hjb_residual = (
                 du_dt
                 # - F_dot_f
-                + 0.5 * g2 * F_norm2 #/ temp_denom
+                + 0.5 * g2 * F_norm2
                 # - div_f
-                + 0.5 * g2 * div_F #/ temp_denom
+                + 0.5 * g2 * div_F
             )
             loss_hjb = hjb_residual * hjb_residual
 

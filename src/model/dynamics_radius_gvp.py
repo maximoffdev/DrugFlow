@@ -19,7 +19,8 @@ class RadiusGVPParams:
 
     # Conditioning
     condition_time: bool = True
-    condition_temperature: bool = True
+    # condition_temperature: bool = True
+    condition_temperature: bool = False
 
     # Conditioning architecture (diffusion-style)
     time_emb_dim: int = 64
@@ -79,7 +80,8 @@ class RadiusGVPDynamics(nn.Module):
         # Diffusion-style conditioning embedding.
         # Keep this internal to the dynamics module; call sites only pass scalars t/temperature.
         self.cond_dim = 0
-        if params.condition_time or params.condition_temperature:
+        # if params.condition_time or params.condition_temperature:
+        if params.condition_time:
             time_emb_dim = int(getattr(params, "time_emb_dim", 64))
             if time_emb_dim % 2 != 0:
                 time_emb_dim += 1
@@ -96,12 +98,12 @@ class RadiusGVPDynamics(nn.Module):
             )
 
         self.temperature_mlp = None
-        if params.condition_temperature:
-            self.temperature_mlp = nn.Sequential(
-                nn.Linear(1, self.cond_dim),
-                nn.SiLU(),
-                nn.Linear(self.cond_dim, self.cond_dim),
-            )
+        # if params.condition_temperature:
+        #     self.temperature_mlp = nn.Sequential(
+        #         nn.Linear(1, self.cond_dim),
+        #         nn.SiLU(),
+        #         nn.Linear(self.cond_dim, self.cond_dim),
+        #     )
 
         node_in_scalar = params.hidden_scalar_nf + self.cond_dim
 
@@ -192,16 +194,16 @@ class RadiusGVPDynamics(nn.Module):
             if cond is not None and self.time_mlp is not None:
                 cond = cond + self.time_mlp(t_node)
 
-        if self.params.condition_temperature:
-            if temperature is None:
-                raise ValueError("temperature is required when condition_temperature=True")
-            if temperature.numel() == 1:
-                # Preserve autograd: avoid converting to Python float.
-                temp_node = temperature.to(device=h.device, dtype=h.dtype).view(1, 1).expand(h.size(0), 1)
-            else:
-                temp_node = temperature[mask_atoms].to(h.dtype)
-            if cond is not None and self.temperature_mlp is not None:
-                cond = cond + self.temperature_mlp(temp_node)
+        # if self.params.condition_temperature:
+        #     if temperature is None:
+        #         raise ValueError("temperature is required when condition_temperature=True")
+        #     if temperature.numel() == 1:
+        #         # Preserve autograd: avoid converting to Python float.
+        #         temp_node = temperature.to(device=h.device, dtype=h.dtype).view(1, 1).expand(h.size(0), 1)
+        #     else:
+        #         temp_node = temperature[mask_atoms].to(h.dtype)
+        #     if cond is not None and self.temperature_mlp is not None:
+        #         cond = cond + self.temperature_mlp(temp_node)
 
         if cond is not None:
             h = torch.cat([h, cond], dim=-1)

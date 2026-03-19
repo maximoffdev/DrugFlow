@@ -131,17 +131,20 @@ class EnergyForceDiffusion(pl.LightningModule):
         # UMA-style target scaling + (optional) energy referencing.
         self.target_sigma, self.omol_elem_ref = utils.parse_dataset_stats(getattr(train_params, "dataset_stats", None))
 
-        # Optional reduced thermodynamic target units for DFT supervision.
-        # When enabled, DFT energies/forces are converted to reduced units by dividing by k_B T_ref.
-        set_default(train_params, "use_reduced_thermo_units", False)
+        # Optional diffusion-output thermodynamic scaling.
+        # Old target-side U/(k_B T_ref) scaling is retired; when enabled now, only the
+        # diffusion-model outputs are multiplied by k_B T_ref to enter physical units.
+        # This fixed thermo reference temperature is also the single temperature reported for
+        # scaling when temperature conditioning itself is commented out.
+        set_default(train_params, "scale_diffusion_by_thermo", False)
         set_default(train_params, "thermo_reference_temperature_K", 300.0)
-        self.use_reduced_thermo_units = bool(getattr(train_params, "use_reduced_thermo_units", False))
+        self.scale_diffusion_by_thermo = bool(getattr(train_params, "scale_diffusion_by_thermo", False))
         self.thermo_reference_temperature_K = float(getattr(train_params, "thermo_reference_temperature_K", 300.0))
-        if self.use_reduced_thermo_units:
+        if self.scale_diffusion_by_thermo:
             if not np.isfinite(self.thermo_reference_temperature_K) or self.thermo_reference_temperature_K <= 0.0:
                 raise ValueError(
                     "train_params.thermo_reference_temperature_K must be a positive finite float when "
-                    "train_params.use_reduced_thermo_units=True"
+                    "train_params.scale_diffusion_by_thermo=True"
                 )
             self.thermo_kbt_ev = float(BOLTZMANN_CONSTANT_EV_PER_K * self.thermo_reference_temperature_K)
             if not np.isfinite(self.thermo_kbt_ev) or self.thermo_kbt_ev <= 0.0:
@@ -224,10 +227,11 @@ class EnergyForceDiffusion(pl.LightningModule):
         set_default(simulation_params, "diffuse_h", True)
         self.diffuse_h = bool(simulation_params.diffuse_h)
 
-        # Temperature is treated as a true conditioning feature.
-        # If the predictor is not conditioned on temperature, then temperature must not
-        # affect training, evaluation, sampling, or the diffusion schedule.
-        self.use_temperature = bool(getattr(predictor_params, "condition_temperature", True))
+        # Temperature conditioning is optional and currently disabled by default.
+        # Boltzmann scaling uses train_params.thermo_reference_temperature_K separately from
+        # any model-side temperature conditioning.
+        # self.use_temperature = bool(getattr(predictor_params, "condition_temperature", True))
+        self.use_temperature = bool(getattr(predictor_params, "condition_temperature", False))
         set_default(simulation_params, "use_temperature", self.use_temperature)
         if bool(getattr(simulation_params, "use_temperature")) != self.use_temperature:
             raise ValueError(
@@ -235,17 +239,21 @@ class EnergyForceDiffusion(pl.LightningModule):
                 "(temperature conditioning is an all-or-nothing feature)."
             )
 
-        # Temperature conditioning (batch-level, like t)
-        set_default(simulation_params, "temperature", 1.0)
-        set_default(simulation_params, "temperature_min", float(simulation_params.temperature))
-        set_default(simulation_params, "temperature_max", float(simulation_params.temperature))
+        # Temperature conditioning (batch-level, like t). In the current setup we keep only
+        # a single fixed scalar for logging/debugging, derived from thermo_reference_temperature_K
+        # whenever diffusion-output Boltzmann scaling is enabled.
+        set_default(simulation_params, "temperature", self.thermo_reference_temperature_K)
+        # set_default(simulation_params, "temperature_min", float(simulation_params.temperature))
+        # set_default(simulation_params, "temperature_max", float(simulation_params.temperature))
         self.temperature = float(simulation_params.temperature)
-        self.temperature_min = float(simulation_params.temperature_min)
-        self.temperature_max = float(simulation_params.temperature_max)
+        # self.temperature_min = float(simulation_params.temperature_min)
+        # self.temperature_max = float(simulation_params.temperature_max)
         if not self.use_temperature:
-            # Ensure we never introduce random temperatures when the feature is disabled.
-            self.temperature_min = self.temperature
-            self.temperature_max = self.temperature
+            # Ensure we never introduce random temperatures when conditioning is disabled.
+            if self.scale_diffusion_by_thermo:
+                self.temperature = float(self.thermo_reference_temperature_K)
+            # self.temperature_min = self.temperature
+            # self.temperature_max = self.temperature
 
         # Atom vocabulary for this dataset
         self.allowed_atomic_numbers = list(train_params.pkl_allowed_atomic_numbers)
@@ -477,8 +485,13 @@ class EnergyForceDiffusion(pl.LightningModule):
         sigma2 = sigma * sigma
         return sigma2 / torch.clamp(sigma2 + float(self.gamma_envelope_eps), min=1e-12)
 
-    def _convert_physical_targets_to_model_units(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.use_reduced_thermo_units:
+    def _scale_diffusion_outputs_to_physical_units(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.scale_diffusion_by_thermo:
+            return x
+        return x * float(self.thermo_kbt_ev)
+
+    def _unscale_physical_outputs_to_score_units(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.scale_diffusion_by_thermo:
             return x
         return x / float(self.thermo_kbt_ev)
 
@@ -490,29 +503,40 @@ class EnergyForceDiffusion(pl.LightningModule):
         t: torch.Tensor,
         temperature: torch.Tensor | float | None = None,
     ) -> dict:
+        energy_diff_raw = pred_diff["energy"]
+        force_diff_raw = pred_diff["force"]
+        energy_diff_physical = self._scale_diffusion_outputs_to_physical_units(energy_diff_raw)
+        force_diff_physical = self._scale_diffusion_outputs_to_physical_units(force_diff_raw)
+
         if pred_corr is None:
             gamma_graph = torch.ones((t.size(0), 1), device=t.device, dtype=t.dtype)
             gamma_node = gamma_graph[batch_mask]
             return {
                 **pred_diff,
-                "energy_diff": pred_diff["energy"],
-                "energy_corr": torch.zeros_like(pred_diff["energy"]),
-                "force_diff": pred_diff["force"],
-                "force_corr_model": torch.zeros_like(pred_diff["force"]),
+                "energy": energy_diff_physical,
+                "force": force_diff_physical,
+                "energy_diff": energy_diff_raw,
+                "energy_diff_physical": energy_diff_physical,
+                "energy_corr": torch.zeros_like(energy_diff_raw),
+                "force_diff": force_diff_raw,
+                "force_diff_physical": force_diff_physical,
+                "force_corr_model": torch.zeros_like(force_diff_raw),
                 "gamma_graph": gamma_graph,
                 "gamma_node": gamma_node,
             }
 
         gamma_graph = self._gamma_envelope(t, temperature=temperature).to(dtype=pred_diff["energy"].dtype)
-        gamma_node = gamma_graph[batch_mask].to(dtype=pred_diff["force"].dtype)
+        gamma_node = gamma_graph[batch_mask].to(dtype=force_diff_raw.dtype)
         return {
             **pred_diff,
-            "energy": gamma_graph.view(-1) * pred_diff["energy"].view(-1) + pred_corr["energy"].view(-1),
-            "force": gamma_node * pred_diff["force"] + pred_corr["force"],
+            "energy": gamma_graph.view(-1) * energy_diff_physical.view(-1) + pred_corr["energy"].view(-1),
+            "force": gamma_node * force_diff_physical + pred_corr["force"],
             "logits_h": pred_diff.get("logits_h", pred_corr.get("logits_h")),
-            "energy_diff": pred_diff["energy"],
+            "energy_diff": energy_diff_raw,
+            "energy_diff_physical": energy_diff_physical,
             "energy_corr": pred_corr["energy"],
-            "force_diff": pred_diff["force"],
+            "force_diff": force_diff_raw,
+            "force_diff_physical": force_diff_physical,
             "force_corr_model": pred_corr["force"],
             "gamma_graph": gamma_graph,
             "gamma_node": gamma_node,
@@ -852,14 +876,15 @@ class EnergyForceDiffusion(pl.LightningModule):
             temperature = None
         else:
             if temperature is None:
-                # Sample a single temperature for the whole batch during training.
-                # Validation uses the fixed temperature from config.
-                if self.training and (self.temperature_min != self.temperature_max):
-                    temp_val = float(
-                        torch.empty((), device=ligand["x"].device).uniform_(self.temperature_min, self.temperature_max).item()
-                    )
-                else:
-                    temp_val = self.temperature
+                # Current setup uses a single fixed conditioning temperature.
+                # Old range-based behavior is intentionally commented out:
+                # if self.training and (self.temperature_min != self.temperature_max):
+                #     temp_val = float(
+                #         torch.empty((), device=ligand["x"].device).uniform_(self.temperature_min, self.temperature_max).item()
+                #     )
+                # else:
+                #     temp_val = self.temperature
+                temp_val = self.temperature
                 temperature = torch.full((ligand["size"].size(0), 1), temp_val, device=ligand["x"].device, dtype=t.dtype)
             else:
                 if isinstance(temperature, (int, float)):
@@ -1169,8 +1194,6 @@ class EnergyForceDiffusion(pl.LightningModule):
                         ).to(dtype=energy_tgt.dtype)
                         energy_tgt = energy_tgt - e_atom_sum
 
-                    energy_tgt = self._convert_physical_targets_to_model_units(energy_tgt)
-
                     loss_energy = torch.abs(energy_pred - energy_tgt)
                     loss_energy = loss_energy * is_t0_graph.to(dtype=loss_energy.dtype)
 
@@ -1184,8 +1207,6 @@ class EnergyForceDiffusion(pl.LightningModule):
                         raise ValueError(
                             f"force must have shape {tuple(force_pred.shape)} to match -dE/dx, got {tuple(force_tgt.shape)}"
                         )
-
-                    force_tgt = self._convert_physical_targets_to_model_units(force_tgt)
 
                     is_t0_node = is_t0_graph[ligand["mask"]]
                     per_node = torch.mean((force_pred.to(dtype=ligand["x"].dtype) - force_tgt) ** 2, dim=-1)
@@ -1211,8 +1232,6 @@ class EnergyForceDiffusion(pl.LightningModule):
                             f"force must have shape {tuple(grad_energy_total.shape)} to match -dU/dx, got {tuple(force_tgt.shape)}"
                         )
 
-                    force_tgt = self._convert_physical_targets_to_model_units(force_tgt)
-
                     is_t0_node = is_t0_graph[ligand["mask"]]
                     per_node = torch.mean(((-grad_energy_total) - force_tgt) ** 2, dim=-1)
                     per_node = per_node * is_t0_node.to(dtype=per_node.dtype)
@@ -1226,7 +1245,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         if need_cfm:
             if self.module_x.sde.kind != "ve":
                 raise ValueError("lambda_cfm is only implemented for coord_sde_kind='ve' (VE kinematics)")
-            assert pred_total is not None
+            assert pred_diff is not None
             assert eps_x is not None
             assert zt_x is not None
             # Build target velocity in flow time t (0 noisy -> 1 clean).
@@ -1243,11 +1262,12 @@ class EnergyForceDiffusion(pl.LightningModule):
             d_sigma_dt = -sigma_tau * log_ratio
             v_target = d_sigma_dt[ligand["mask"]] * eps_x
 
-            force_pred = pred_total.get("force", pred_total.get("v", None))
+            force_pred = pred_diff.get("force", pred_diff.get("v", None))
             if force_pred is None:
-                raise KeyError("Dynamics must return 'force_fm' or ('force'/'v')")
+                raise KeyError("Dynamics must return 'force' (preferred) or legacy 'v'")
 
-            # The model field is already represented in reduced score/force units.
+            # Phase-1 flow matching is supervised in score/force units, so it consumes the
+            # raw diffusion predictor output before any thermo scaling for phase 2.
             force_pred_model = force_pred.to(dtype=ligand["x"].dtype)
 
             # Velocity for flow-matching loss is computed directly from predicted force:
@@ -1306,7 +1326,7 @@ class EnergyForceDiffusion(pl.LightningModule):
             "phase_is_correction": float(1.0 if correction_active else 0.0),
             "use_gamma_scaling": float(1.0 if self.use_gamma_scaling else 0.0),
             "gamma_mean": float(pred_total["gamma_graph"].mean().detach().cpu()) if pred_total is not None else 1.0,
-            "use_reduced_thermo_units": float(1.0 if self.use_reduced_thermo_units else 0.0),
+            "scale_diffusion_by_thermo": float(1.0 if self.scale_diffusion_by_thermo else 0.0),
             "thermo_reference_temperature_K": float(self.thermo_reference_temperature_K),
             "thermo_kbt_ev": float(self.thermo_kbt_ev),
         }
@@ -1401,7 +1421,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.log("temperature/train", info["temperature"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("phase_is_correction/train", info["phase_is_correction"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("gamma_mean/train", info["gamma_mean"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
-        self.log("use_reduced_thermo_units/train", info["use_reduced_thermo_units"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("scale_diffusion_by_thermo/train", info["scale_diffusion_by_thermo"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("thermo_reference_temperature_K/train", info["thermo_reference_temperature_K"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("thermo_kbt_ev/train", info["thermo_kbt_ev"], on_step=True, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         if self.log_diffusion_stats:
@@ -1469,7 +1489,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.log("temperature/val", info["temperature"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("phase_is_correction/val", info["phase_is_correction"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("gamma_mean/val", info["gamma_mean"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
-        self.log("use_reduced_thermo_units/val", info["use_reduced_thermo_units"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("scale_diffusion_by_thermo/val", info["scale_diffusion_by_thermo"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("thermo_reference_temperature_K/val", info["thermo_reference_temperature_K"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("thermo_kbt_ev/val", info["thermo_kbt_ev"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         if self.log_diffusion_stats:
@@ -1537,7 +1557,7 @@ class EnergyForceDiffusion(pl.LightningModule):
         self.log("temperature/test", info["temperature"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("phase_is_correction/test", info["phase_is_correction"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("gamma_mean/test", info["gamma_mean"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
-        self.log("use_reduced_thermo_units/test", info["use_reduced_thermo_units"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
+        self.log("scale_diffusion_by_thermo/test", info["scale_diffusion_by_thermo"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("thermo_reference_temperature_K/test", info["thermo_reference_temperature_K"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         self.log("thermo_kbt_ev/test", info["thermo_kbt_ev"], on_step=False, on_epoch=True, batch_size=len(batch["ligand"]["size"]))
         return {"loss": loss, **info}
@@ -1725,8 +1745,9 @@ class EnergyForceDiffusion(pl.LightningModule):
                 if F is None:
                     raise KeyError("Dynamics must return 'force' (preferred) or legacy 'v'")
 
-                # The model field is already represented in reduced score/force units.
-                F = F.to(dtype=x.dtype)
+                # The combined phase-2 field is represented in physical units; convert back
+                # to score units only at the sampler boundary.
+                F = self._unscale_physical_outputs_to_score_units(F.to(dtype=x.dtype))
 
                 s_tau = 1.0 - s
                 f = self.module_x._sde_f_forward(x, s_tau, batch_mask, temperature=sampler_temperature).to(dtype=x.dtype)
@@ -1748,7 +1769,7 @@ class EnergyForceDiffusion(pl.LightningModule):
                 if score_s is None:
                     raise KeyError("Dynamics must return 'force' (preferred) or legacy 'v'")
 
-                score_s = score_s.to(dtype=x.dtype)
+                score_s = self._unscale_physical_outputs_to_score_units(score_s.to(dtype=x.dtype))
                 s_tau = 1.0 - s
                 t_tau = 1.0 - t
                 x = self.module_x.reverse_step(

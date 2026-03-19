@@ -22,7 +22,7 @@ train_params:
   batch_size: 4
   accumulate_grad_batches: 2
   lr: 5.0e-4
-  n_epochs: 5
+  n_epochs: 1000
   pretrain_diff_epochs: 0
   num_workers: 0
   gpus: 1
@@ -50,10 +50,12 @@ train_params:
   # Optional: limit files for debugging, for full dataset use null
   pkl_file_limit: null
 
-  # Convert supervised DFT energies/forces into reduced thermodynamic units U/(k_B T_ref)
-  # and F/(k_B T_ref). This leaves DSM score targets and sampler equations unchanged while
-  # making the supervised targets score-compatible.
-  use_reduced_thermo_units: True
+  # Retired target-side temperature scaling:
+  # use_reduced_thermo_units: False
+  # Old behavior divided DFT supervision by k_B T_ref. The new behavior keeps targets
+  # in physical units and scales only the diffusion-model outputs by the single fixed
+  # Boltzmann reference temperature k_B * thermo_reference_temperature_K below.
+  scale_diffusion_by_thermo: True
   thermo_reference_temperature_K: 300.0
 
 wandb_params:
@@ -136,11 +138,12 @@ simulation_params:
   sigma_max: 5.0
   coord_sde_kind: ve
 
-  # Temperature conditioning
-  use_temperature: False
-  temperature: 1.0
-  temperature_min: 1.0
-  temperature_max: 1.0
+  # Temperature conditioning is commented out. Boltzmann scaling uses only
+  # train_params.thermo_reference_temperature_K above.
+  # use_temperature: False
+  # temperature: 300.0
+  # temperature_min: 300.0
+  # temperature_max: 300.0
 
 eval_params:
   eval_batch_size: 32
@@ -150,7 +153,7 @@ eval_params:
 predictor_params:
   backbone: gvp
   condition_time: True
-  condition_temperature: False  # ignored; temperature conditioning follows simulation_params.use_temperature
+  # condition_temperature: False  # commented out with model-side temperature conditioning
 
   # Scale the two force heads (set to 0.0 to disable one component).
   # force_fm_scale: 1.0
