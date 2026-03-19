@@ -1117,17 +1117,25 @@ class CoordScoreDiffusion:
             du_dt = torch.zeros((B,), device=x.device, dtype=x.dtype)
             div_F = torch.zeros((B,), device=x.device, dtype=x.dtype)
 
+        f = self._sde_f_forward(x, tau, batch_mask, temperature=temperature_t)
+        div_f = self._sde_div_f_forward(x, tau, batch_mask, temperature=temperature_t)
+        F_dot_f = scatter_add(torch.sum(F_hjb * f, dim=-1), batch_mask, dim=0)
+
         g2 = self._sde_g2_forward(tau, temperature=temperature_t)
         F_norm2 = scatter_add(torch.sum(F_hjb * F_hjb, dim=-1), batch_mask, dim=0)
+        hjb_scale = 1.0
+        if self.sde.kind == "vp":
+            sigma2 = self.sigma(tau, temperature=temperature_t).view(-1).square()
+            hjb_scale = (sigma2 / torch.clamp(g2, min=1e-12)).detach()
 
         if compute_hjb:
             hjb_residual = (
                 du_dt
-                # - F_dot_f
+                - F_dot_f
                 + 0.5 * g2 * F_norm2
-                # - div_f
+                - div_f
                 + 0.5 * g2 * div_F
-            )
+            ) * hjb_scale
             loss_hjb = hjb_residual * hjb_residual
 
         else:

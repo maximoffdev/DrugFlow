@@ -136,7 +136,12 @@ simulation_params:
   # Score diffusion noise schedule for coordinates (t=0 noise -> t=1 clean)
   sigma_min: 0.01
   sigma_max: 5.0
-  coord_sde_kind: ve
+
+  vp_beta_min: 0.1
+  vp_beta_max: 10.0
+  vp_sigma_scale: 1.0
+
+  coord_sde_kind: vp
 
   # Temperature conditioning is commented out. Boltzmann scaling uses only
   # train_params.thermo_reference_temperature_K above.
